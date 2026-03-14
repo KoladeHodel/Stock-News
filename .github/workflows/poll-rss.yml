@@ -43,7 +43,7 @@ jobs:
           # Tuning (change as desired)
           TIMEZONE: Europe/Paris
           DAILY_DIGEST_HOUR: '8'
-          MAX_TICKERS: '300'      # default tickers processed per run (tweakable)
+          MAX_TICKERS: '200'      # default tickers processed per run (tweakable)
           THROTTLE_SECONDS: '0.4' # pause between feed polls to be polite
         run: |
           python main_improved_action.py
