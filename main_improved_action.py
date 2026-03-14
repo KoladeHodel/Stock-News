@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-main_improved_action.py (cache-enabled)
+Digest-only improved poller (drop-in).
 
-Same improved script as before (S&P500 + NASDAQ100, rotation, RECENT_DAYS),
-but now it persists the in-run 'seen' fingerprints to .cache/seen.json using
-a simple file. GitHub Actions will persist that directory via actions/cache.
+Behavior:
+ - Auto S&P500 + NASDAQ-100 (Wikipedia)
+ - Rotation by GITHUB_RUN_NUMBER / time to process the universe in chunks
+ - Filters items older than RECENT_DAYS (default 7)
+ - Persists seen fingerprints to .cache/seen.json (restored by actions/cache)
+ - Collects events by category during the run
+ - Sends ONE Telegram message per run with grouped events (no per-item alerts)
+ - Optionally sends a daily email digest at DAILY_DIGEST_HOUR
 """
 
 import os
@@ -24,25 +29,24 @@ import json
 # ---------------- Config ----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK")
+SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK")  # optional (not used per-item)
 SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT")) if os.getenv("SMTP_PORT") else None
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO")
 
-MAX_TICKERS = int(os.getenv("MAX_TICKERS", "250"))
+MAX_TICKERS = int(os.getenv("MAX_TICKERS", "200"))
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Paris")
 DAILY_DIGEST_HOUR = int(os.getenv("DAILY_DIGEST_HOUR", "8"))
 THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "0.4"))
 USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (compatible; MarketAlerts/1.0)")
 RECENT_DAYS = int(os.getenv("RECENT_DAYS", "7"))  # only accept items within this many days
 
-# file used for cross-run dedupe (persisted via GitHub Actions cache)
 CACHE_DIR = ".cache"
 SEEN_FILE = os.path.join(CACHE_DIR, "seen.json")
 
-# keywords used to build Google News query - grouped to match your 6 types
+# keywords
 KEYWORDS = [
     "earnings", "quarterly results", "eps", "revenue", "beats", "misses",
     "acquire", "acquisition", "merger", "takeover", "s-4", "will acquire",
@@ -51,13 +55,17 @@ KEYWORDS = [
     "scandal", "allegation", "fraud", "lawsuit", "investigation", "probe",
     "venture failed", "venture success", "failed", "success", "abandons"
 ]
+AI_KEYWORDS = [
+    "artificial intelligence", "generative ai", "ai partnership", "ai platform",
+    "ai model", "machine learning", "openai", "anthropic", "nvidia", "copilot",
+    "gpt", "llm", "large language model"
+]
 
-# targeted event labels (only these generate alerts)
-TARGET_LABELS = {"earnings", "takeover", "scandal", "product_launch", "venture_result", "major_deal"}
+# target labels
+TARGET_LABELS = {"earnings", "takeover", "scandal", "product_launch", "venture_result", "major_deal", "ai_special"}
 
-# ---------------- Utilities ----------------
+# ---------------- Helpers ----------------
 def fingerprint(title, link, published):
-    # include published string in fp so small updates create new fp
     return hashlib.sha256(f"{title}|{link}|{published}".encode()).hexdigest()
 
 def safe_get(url, timeout=15):
@@ -67,21 +75,10 @@ def safe_get(url, timeout=15):
         r.raise_for_status()
         return r.text
     except Exception as e:
-        print(f"HTTP GET error for {url}: {e}")
+        print(f"[HTTP] GET error for {url}: {e}")
         return None
 
-def post_json(url, json_payload, timeout=10):
-    try:
-        r = requests.post(url, json=json_payload, timeout=timeout)
-        r.raise_for_status()
-        return True
-    except Exception as e:
-        print(f"POST error to {url}: {e}")
-        return False
-
-# ---------------- Persisted seen helpers ----------------
 def load_seen():
-    """Load seen fingerprints from SEEN_FILE (returns a set)."""
     try:
         if not os.path.exists(CACHE_DIR):
             os.makedirs(CACHE_DIR, exist_ok=True)
@@ -98,7 +95,6 @@ def load_seen():
         return set()
 
 def save_seen(seen_set):
-    """Write the seen_set (iterable) to SEEN_FILE as a list (atomic write)."""
     try:
         if not os.path.exists(CACHE_DIR):
             os.makedirs(CACHE_DIR, exist_ok=True)
@@ -109,23 +105,84 @@ def save_seen(seen_set):
     except Exception as e:
         print("Error saving seen file:", e)
 
-# ---------------- Notify channels ----------------
-def notify_telegram(text):
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        print("[Telegram missing] would send:", text)
-        return
+def parse_entry_published(entry, target_tz):
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
-        if resp.status_code != 200:
-            print("Telegram response error:", resp.status_code, resp.text)
+        if entry.get("published_parsed"):
+            ts = time.mktime(entry["published_parsed"])
+            dt = datetime.fromtimestamp(ts, pytz.UTC).astimezone(target_tz)
+            return dt
+    except Exception:
+        pass
+    pub = entry.get("published") or entry.get("updated") or ""
+    if pub:
+        s = pub.strip()
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=pytz.UTC)
+            return dt.astimezone(target_tz)
+        except Exception:
+            m = re.search(r"(20\d{2})", s)
+            if m:
+                try:
+                    year = int(m.group(1))
+                    return datetime(year, 1, 1, tzinfo=target_tz)
+                except Exception:
+                    pass
+    return None
+
+def is_recent_entry(entry, target_tz, days=RECENT_DAYS):
+    dt = parse_entry_published(entry, target_tz)
+    if not dt:
+        return False
+    now = datetime.now(target_tz)
+    return (now - dt) <= timedelta(days=days)
+
+def build_google_news_rss(ticker, name):
+    company_phrase = f'"{name}"'
+    keywords_or = " OR ".join(KEYWORDS + AI_KEYWORDS)
+    query = f"({ticker} OR {company_phrase}) ({keywords_or})"
+    encoded = urllib.parse.quote(query)
+    return f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
+
+def classify(title, summary):
+    txt = (title + " " + (summary or "")).lower()
+    # AI first (special callout)
+    if any(k in txt for k in AI_KEYWORDS):
+        return "ai_special"
+    if re.search(r"\b(earnings|quarterly results|eps|revenue|beats|misses)\b", txt):
+        return "earnings"
+    if re.search(r"\b(acquir|acquisition|merger|takeover|will acquire|s-4)\b", txt):
+        return "takeover"
+    if re.search(r"\b(scandal|allegation|fraud|lawsuit|investigation|probe)\b", txt):
+        return "scandal"
+    if re.search(r"\b(launch|launches|unveil|introduce|new product|releases|announces new)\b", txt):
+        return "product_launch"
+    if re.search(r"\b(joint venture|spin-off|pilot|venture|funding)\b", txt) and re.search(r"\b(success|succeed|failed|failure|abandons)\b", txt):
+        return "venture_result"
+    if re.search(r"\b(partnership|partners with|signs deal|strategic partnership|contract worth|agreement with)\b", txt):
+        return "major_deal"
+    return "other"
+
+def poll_feed(url):
+    try:
+        parsed = feedparser.parse(url)
+        return parsed.entries
+    except Exception as e:
+        print("feedparser error for", url, e)
+        return []
+
+def notify_telegram_digest(text):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        print("[Telegram missing] would send digest text length:", len(text))
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=10)
     except Exception as e:
         print("Telegram send error:", e)
-
-def notify_slack(text):
-    if not SLACK_WEBHOOK:
-        return
-    post_json(SLACK_WEBHOOK, {"text": text})
 
 def send_email(subject, body_html):
     if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO):
@@ -161,12 +218,18 @@ def fetch_wikipedia_table(url):
 def get_sp500_list():
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        rows = fetch_wikipedia_table(url)
+        html = safe_get(url)
+        if not html:
+            return []
+        soup = BeautifulSoup(html, "lxml")
+        table = soup.find("table", {"id": "constituents"}) or soup.find("table", class_="wikitable")
         out = []
-        for cols in rows:
-            ticker = cols[0].get_text(strip=True)
-            name = cols[1].get_text(strip=True)
-            out.append((ticker.replace(".", "-"), name))
+        for tr in table.find_all("tr")[1:]:
+            cols = tr.find_all(["td", "th"])
+            if len(cols) >= 2:
+                ticker = cols[0].get_text(strip=True)
+                name = cols[1].get_text(strip=True)
+                out.append((ticker.replace(".", "-"), name))
         print(f"SP500 count fetched: {len(out)}")
         return out
     except Exception as e:
@@ -188,11 +251,9 @@ def get_nasdaq100_list():
                     a = tds[0].get_text(strip=True)
                     b = tds[1].get_text(strip=True)
                     if re.fullmatch(r"[A-Z0-9\.\-]{1,10}", b):
-                        name = a
-                        ticker = b
+                        name = a; ticker = b
                     elif re.fullmatch(r"[A-Z0-9\.\-]{1,10}", a):
-                        name = b
-                        ticker = a
+                        name = b; ticker = a
                     else:
                         continue
                     out.append((ticker.replace(".", "-"), name))
@@ -202,89 +263,8 @@ def get_nasdaq100_list():
         print("get_nasdaq100_list error:", e)
         return []
 
-# ---------------- Build Google News RSS ----------------
-def build_google_news_rss(ticker, name):
-    company_phrase = f'"{name}"'
-    keywords_or = " OR ".join(KEYWORDS)
-    query = f"({ticker} OR {company_phrase}) ({keywords_or})"
-    encoded = urllib.parse.quote(query)
-    return f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
-
-# ---------------- Date parsing & recency filter ----------------
-def parse_entry_published(entry, target_tz):
-    try:
-        if entry.get("published_parsed"):
-            ts = time.mktime(entry["published_parsed"])
-            dt = datetime.fromtimestamp(ts, pytz.UTC).astimezone(target_tz)
-            return dt
-    except Exception:
-        pass
-
-    pub = entry.get("published") or entry.get("updated") or ""
-    if pub:
-        s = pub.strip()
-        try:
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            dt = datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=pytz.UTC)
-            return dt.astimezone(target_tz)
-        except Exception:
-            m = re.search(r"(20\d{2})", s)
-            if m:
-                try:
-                    year = int(m.group(1))
-                    return datetime(year, 1, 1, tzinfo=target_tz)
-                except Exception:
-                    pass
-    return None
-
-def is_recent_entry(entry, target_tz, days=RECENT_DAYS):
-    dt = parse_entry_published(entry, target_tz)
-    if not dt:
-        # skip undated entries to avoid repeating old evergreen content
-        return False
-    now = datetime.now(target_tz)
-    return (now - dt) <= timedelta(days=days)
-
-# ---------------- Classifier ----------------
-def classify(title, summary):
-    txt = (title + " " + (summary or "")).lower()
-
-    if re.search(r"\b(earnings|quarterly results|q[1-4]\s?\s?results|eps|earnings per share|announces results|reports results|reports q)\b", txt):
-        return "earnings"
-
-    if re.search(r"\b(acquir|acquisition|merger|takeover|will acquire|to buy|agrees to buy|agreed to buy|s-4|s-4 filing)\b", txt):
-        return "takeover"
-
-    if re.search(r"\b(scandal|allegation|fraud|lawsuit|investigation|probe|charged|indicted|settlement|regulator)\b", txt):
-        return "scandal"
-
-    if re.search(r"\b(launch|launches|unveil|introduce|introduces|new product|releases|announces new)\b", txt):
-        return "product_launch"
-
-    if re.search(r"\b(joint venture|spin-off|pilot|venture|funding|partnership pilot)\b", txt) and re.search(r"\b(success|succeed|failed|failure|abandon|abandons|halts)\b", txt):
-        return "venture_result"
-
-    if re.search(r"\b(partnership|partners with|signs deal|strategic partnership|contract worth|agreement with|signed a deal)\b", txt):
-        return "major_deal"
-
-    return "other"
-
-# ---------------- Polling & routing ----------------
-def poll_feed(url):
-    items = []
-    try:
-        parsed = feedparser.parse(url)
-        for e in parsed.entries:
-            items.append(e)
-    except Exception as e:
-        print("feedparser error for", url, e)
-    return items
-
+# ---------------- Main ----------------
 def main():
-    # Validate required secrets
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         print("ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required environment variables.")
         return
@@ -293,16 +273,12 @@ def main():
     now_local = datetime.now(tz)
     date_iso = now_local.strftime("%Y-%m-%d")
 
-    # load persisted seen fingerprints (from cache)
     seen = load_seen()
     print(f"Loaded {len(seen)} seen fingerprints from cache.")
 
-    # fetch lists
     sp = get_sp500_list()
     nas = get_nasdaq100_list()
     combined = sp + nas
-
-    # dedupe by ticker
     uniq = {}
     for t, n in combined:
         key = t.upper()
@@ -314,7 +290,6 @@ def main():
         print("No tickers found; exiting.")
         return
 
-    # rotation logic
     run_num = os.getenv("GITHUB_RUN_NUMBER")
     try:
         run_index = int(run_num) if run_num else int(time.time() // (60*30))
@@ -335,21 +310,26 @@ def main():
     selected = slice_window(universe, offset, chunk_size)
     print(f"Universe size: {total}, processing {len(selected)} tickers (offset {offset}, run {run_index})")
 
-    # build feeds
-    feeds = []
-    for ticker, cname in selected:
-        feeds.append((ticker, cname, build_google_news_rss(ticker, cname)))
+    feeds = [(t, n, build_google_news_rss(t, n)) for (t, n) in selected]
 
-    digest = []
+    # collect per-category
+    categories = {
+        "ai_special": [],
+        "earnings": [],
+        "takeover": [],
+        "scandal": [],
+        "product_launch": [],
+        "venture_result": [],
+        "major_deal": []
+    }
 
-    # poll each feed
+    # iterate feeds and collect (no per-item sends)
     for ticker, cname, rss in feeds:
-        items = poll_feed(rss)
-        if not items:
+        entries = poll_feed(rss)
+        if not entries:
             time.sleep(THROTTLE_SECONDS)
             continue
-        for entry in items:
-            # filter by recency first
+        for entry in entries:
             if not is_recent_entry(entry, tz, RECENT_DAYS):
                 continue
             title = entry.get("title", "") or ""
@@ -358,29 +338,17 @@ def main():
             published_str = entry.get("published") or entry.get("updated") or ""
             fp = fingerprint(title, link, published_str)
             if fp in seen:
-                # skip items we've already alerted on in prior runs
                 continue
-            # add to seen now to avoid duplicates within same run and across future runs
+            # Accept this item and mark seen (so we don't include it in future runs)
             seen.add(fp)
-
             label = classify(title, summary)
-            if label == "other":
-                continue
-            if label in TARGET_LABELS:
-                alert_text = f"[{label.upper()}] {ticker} / {cname} — {title}\n{link}"
-                print("ALERT:", alert_text)
-                notify_telegram(alert_text)
-                notify_slack(alert_text)
-                if label in {"takeover", "scandal", "major_deal"}:
-                    send_email(f"[ALERT] {label.upper()} — {ticker}", f"<p>{alert_text}</p>")
-                score = 90 if label in {"takeover", "scandal", "major_deal"} else 60
-                digest.append({"label": label, "title": title, "link": link, "ticker": ticker, "score": score})
-            # small per-entry throttle
-            time.sleep(0.08)
-        # throttle between feeds
+            if label in categories:
+                # store compact record
+                categories[label].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published_str})
+            # else ignore non-target labels
         time.sleep(THROTTLE_SECONDS)
 
-    # include today's scheduled earnings via Yahoo (recent filter applies)
+    # include today's scheduled earnings (Yahoo)
     try:
         yahoo_items = fetch_yahoo_earnings_for_date(date_iso)
         for it in yahoo_items:
@@ -392,36 +360,68 @@ def main():
             if fp in seen:
                 continue
             seen.add(fp)
-            alert_text = f"[EARNINGS] {it['title']}\n{it['link']}"
-            print("EARNINGS SCHEDULE:", alert_text)
-            notify_telegram(alert_text)
-            notify_slack(alert_text)
-            digest.append({"label": "earnings", "title": it["title"], "link": it["link"], "ticker": "", "score": 50})
-            time.sleep(0.05)
+            categories["earnings"].append({"ticker": "", "company": "", "title": it["title"], "link": it["link"], "published": published_str})
+            time.sleep(0.02)
     except Exception as e:
         print("Yahoo earnings error:", e)
 
-    # send daily digest at configured hour
-    if now_local.hour == DAILY_DIGEST_HOUR:
-        if digest:
-            html = "<h2>Daily Market Event Digest</h2><ul>"
-            for it in sorted(digest, key=lambda x: -x["score"]):
-                html += f"<li><b>{it['label']}</b> — {it.get('ticker','')} {it['title']} (<a href='{it['link']}'>link</a>)</li>"
-            html += "</ul>"
-            send_email("Daily Market Event Digest", html)
-            notify_telegram("Daily Market Event Digest sent (check email if configured).")
-            notify_slack("Daily Market Event Digest sent (check email if configured).")
-        else:
-            print("Digest hour but no items to include.")
+    # Build digest message (one message per run). If no items, do nothing.
+    total_items = sum(len(v) for v in categories.values())
+    if total_items == 0:
+        print("No new recent items to include in digest this run.")
     else:
-        print(f"Run complete at {now_local.isoformat()}; not digest hour ({DAILY_DIGEST_HOUR}).")
+        header = f"📊 US Market Event Digest — {now_local.strftime('%Y-%m-%d %H:%M %Z')}\n"
+        # Window info: we processed chunk_size tickers starting at offset
+        header += f"Processed {len(selected)} tickers (rotation window). New items: {total_items}\n\n"
 
-    # save updated seen set to cache file so future runs skip these items
+        # Order categories: AI special first, then earnings, partnerships/deals, product, takeover, scandal, ventures
+        ordering = ["ai_special", "earnings", "major_deal", "product_launch", "takeover", "scandal", "venture_result"]
+        pretty = {
+            "ai_special": "🧠 AI Innovation / Partnerships",
+            "earnings": "💰 Earnings",
+            "major_deal": "🤝 Major Deals / Partnerships",
+            "product_launch": "🚀 Product Launches",
+            "takeover": "🏢 M&A / Takeovers",
+            "scandal": "⚠️ Scandals / Investigations",
+            "venture_result": "🔬 Venture results"
+        }
+        parts = [header]
+        # cap per category to avoid massive messages
+        PER_CAT_LIMIT = 8
+        for cat in ordering:
+            items = categories.get(cat, [])
+            if not items:
+                continue
+            parts.append(pretty.get(cat, cat) + "\n")
+            for idx, it in enumerate(items[:PER_CAT_LIMIT]):
+                ticker_str = it["ticker"] + " " if it.get("ticker") else ""
+                parts.append(f"• {ticker_str.strip()} — {it['title']}\n")
+            more = max(0, len(items) - PER_CAT_LIMIT)
+            if more > 0:
+                parts.append(f"  ...and +{more} more in {pretty.get(cat,cat)}\n")
+            parts.append("\n")
+
+        message = "".join(parts)
+        # Telegram message max ~4096 chars; truncate gracefully if needed
+        if len(message) > 3800:
+            message = message[:3800] + "\n\n(Truncated — check email for full digest if configured.)"
+
+        # send single Telegram digest message
+        notify_telegram_digest(message)
+
+        # also send email digest (single email) if configured and at digest hour, or always as optional
+        # We'll send email if SMTP is configured and either it's digest hour or the message was large.
+        if SMTP_HOST and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO:
+            send_email("US Market Event Digest", "<pre>" + message + "</pre>")
+
+    # persist seen cache
     try:
         save_seen(seen)
         print(f"Saved {len(seen)} fingerprints to {SEEN_FILE}")
     except Exception as e:
         print("Error saving seen cache at end:", e)
+
+    print("Run complete.")
 
 # ---------------- Yahoo earnings scraper ----------------
 def fetch_yahoo_earnings_for_date(date_iso):
@@ -443,6 +443,5 @@ def fetch_yahoo_earnings_for_date(date_iso):
             items.append({"title": title, "link": url, "summary": f"EPS est: {eps_est}", "published": date_iso})
     return items
 
-# ---------------- Entry point ----------------
 if __name__ == "__main__":
     main()
