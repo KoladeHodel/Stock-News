@@ -1,10 +1,8 @@
-name: Poll US Market (S&P500 + NASDAQ100) & Alerts (no-persist)
+name: Poll US Market (S&P500 + NASDAQ100) & Alerts (no-persist but cached seen)
 
 on:
   schedule:
-    # every 30 minutes
     - cron: '*/30 * * * *'
-    # daily digest at 08:00 Europe/Paris -> 07:00 UTC (adjust if you need different alignment)
     - cron: '0 7 * * *'
   workflow_dispatch: {}
 
@@ -14,6 +12,15 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Restore seen cache
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: market-seen-v1-${{ runner.os }}
+          # allow fallback if key changes in future
+          restore-keys: |
+            market-seen-v1-
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v4
@@ -25,25 +32,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install feedparser requests pytz beautifulsoup4 lxml
 
-      - name: Run improved poller
-        # ensure the script file is named main_improved_action.py in repository root
+      - name: Run improved poller (cache-aware)
         env:
-          # REQUIRED (Telegram)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-          # Optional additional channels
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
-
-          # Tuning (change as desired)
           TIMEZONE: Europe/Paris
           DAILY_DIGEST_HOUR: '8'
-          MAX_TICKERS: '200'      # default tickers processed per run (tweakable)
-          THROTTLE_SECONDS: '0.4' # pause between feed polls to be polite
+          MAX_TICKERS: '200'      # your updated choice
+          THROTTLE_SECONDS: '0.4'
+          RECENT_DAYS: '7'        # keep 7 days by default
         run: |
+          # ensure cache dir exists (cache action restored it if available)
+          mkdir -p .cache
           python main_improved_action.py
