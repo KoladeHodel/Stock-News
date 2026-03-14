@@ -395,14 +395,21 @@ def main():
 
     added_this_run = set()
 
-    # include upcoming earnings first — DO NOT mark as seen (so they show every morning)
-    for it in upcoming:
-        title = it["title"]; link = it["link"]; published = it["published"]
-        fp = fingerprint(title, link, published)
-        if fp in added_this_run:
-            continue
-        added_this_run.add(fp)
-        categories["upcoming_earnings"].append({"title": title, "link": link, "published": published, "ticker": it.get("ticker"), "company": it.get("company")})
+    # include upcoming earnings first — DO NOT mark as seen or added_this_run
+    # only include in the morning digest (so evening delta won't repeat them)
+    if is_morning:
+        for it in upcoming:
+            title = it["title"]
+            link = it["link"]
+            published = it["published"]
+            # include ticker/company if present (Yahoo scraper may provide them)
+            categories["upcoming_earnings"].append({
+                "title": title,
+                "link": link,
+                "published": published,
+                "ticker": it.get("ticker"),
+                "company": it.get("company")
+            })
 
     # Poll feeds & collect items (feed items ARE marked seen to avoid repeats)
     for ticker, cname, rss in feeds:
