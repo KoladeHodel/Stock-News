@@ -1,9 +1,14 @@
-name: Poll US Market (S&P500 + NASDAQ100) & Alerts (no-persist but cached seen)
+name: Poll US Market (S&P500 + NASDAQ100) & Digest (morning + evening delta)
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
-    - cron: '0 7 * * *'
+    # To handle Europe/Paris DST transitions robustly, run at both possible UTC offsets.
+    # These runs are cheap; the script itself only sends when local time is 05:00 or 18:00.
+    - cron: '03 03 * * *'   # fallback run (rare) — kept for coverage (safe)
+    - cron: '00 03 * * *'   # 03:00 UTC
+    - cron: '00 04 * * *'   # 04:00 UTC (covers CET/CEST differences for morning)
+    - cron: '00 16 * * *'   # 16:00 UTC
+    - cron: '00 17 * * *'   # 17:00 UTC (covers CET/CEST differences for evening)
   workflow_dispatch: {}
 
 jobs:
@@ -18,7 +23,6 @@ jobs:
         with:
           path: .cache
           key: market-seen-v1-${{ runner.os }}
-          # allow fallback if key changes in future
           restore-keys: |
             market-seen-v1-
 
@@ -32,7 +36,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install feedparser requests pytz beautifulsoup4 lxml
 
-      - name: Run improved poller (cache-aware)
+      - name: Run improved digest poller (morning + evening delta)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -43,11 +47,18 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
           TIMEZONE: Europe/Paris
-          DAILY_DIGEST_HOUR: '8'
-          MAX_TICKERS: '200'      # your updated choice
+          DAILY_DIGEST_HOUR_MORNING: '5'
+          DAILY_DIGEST_HOUR_EVENING: '18'
+          MAX_TICKERS: '200'
           THROTTLE_SECONDS: '0.4'
-          RECENT_DAYS: '7'        # keep 7 days by default
+          RECENT_DAYS: '7'
+          UPCOMING_DAYS: '7'
         run: |
-          # ensure cache dir exists (cache action restored it if available)
           mkdir -p .cache
           python main_improved_action.py
+
+      - name: Save seen cache
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: market-seen-v1-${{ runner.os }}
