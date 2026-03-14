@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-main_improved_action.py — drop-in final with robust per-ticker earnings (JSON -> HTML scrape fallback),
-aggressive per-ticker supplement, batch processing across full universe, telegram splitter, and full-email attachment.
-
-Drop this file into your repo (overwrite existing main_improved_action.py) and push.
+main_improved_action.py — drop-in final with:
+ - batch processing across universe (optionally single batch)
+ - robust upcoming earnings (calendar + per-ticker JSON -> HTML fallback)
+ - safe_get_json with HTTP status counters
+ - per-ticker failure cache to avoid repeated retries
+ - Telegram splitter (no truncation) + full-email attachment
+ - morning-only upcoming earnings (not marked seen)
+ - manual workflow_dispatch support (MANUAL_MODE)
 """
 
 import os
@@ -23,7 +27,6 @@ import smtplib
 # ---------------- Config (env) ----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK")
 SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT")) if os.getenv("SMTP_PORT") else None
 SMTP_USER = os.getenv("SMTP_USER")
@@ -63,6 +66,10 @@ DEAL_KEYWORDS = ["partnership","partners with","signs deal","strategic partnersh
 MNA_KEYWORDS = ["acquir","acquisition","merger","takeover","s-4","will acquire","to buy","agrees to buy"]
 EARNINGS_KEYWORDS = ["earnings","quarterly results","eps","revenue","beats","misses"]
 
+# ---------------- per-run stats & caches ----------------
+PER_TICKER_STATS = {"json_401": 0, "json_403": 0, "page_404": 0, "page_other_errors": 0, "json_other": 0}
+PER_TICKER_CACHE_FAIL = {}  # ticker -> short reason for skipping further attempts this run
+
 # ---------------- Helpers ----------------
 def ensure_cache_dir():
     try:
@@ -85,12 +92,31 @@ def safe_get(url, timeout=15):
         return None
 
 def safe_get_json(url, timeout=15):
+    """
+    Improved safe JSON fetch that records 401/403/404 and other statuses in PER_TICKER_STATS,
+    returns None on error so callers will fall back to HTML scraping.
+    """
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     try:
         r = requests.get(url, timeout=timeout, headers=headers)
         r.raise_for_status()
         return r.json()
+    except requests.exceptions.HTTPError as he:
+        status = None
+        try:
+            status = he.response.status_code
+        except Exception:
+            pass
+        if status == 401:
+            PER_TICKER_STATS["json_401"] += 1
+        elif status == 403:
+            PER_TICKER_STATS["json_403"] += 1
+        else:
+            PER_TICKER_STATS["json_other"] += 1
+        print(f"[HTTP JSON] GET error for {url}: {he} (status={status})")
+        return None
     except Exception as e:
+        PER_TICKER_STATS["json_other"] += 1
         print(f"[HTTP JSON] GET error for {url}: {e}")
         return None
 
@@ -242,7 +268,6 @@ def fetch_yahoo_earnings_for_date_json(date_iso):
                     title = f"Earnings scheduled: {sym} ({name}) {time_of_day}".strip()
                     results.append({"title": title, "link": url, "published": date_iso, "ticker": sym, "company": name})
         if not results:
-            # fallback: walk JSON to find likely earnings entries
             def walk_find(obj):
                 found = []
                 if isinstance(obj, dict):
@@ -261,7 +286,6 @@ def fetch_yahoo_earnings_for_date_json(date_iso):
             results = walk_find(data)
     except Exception as e:
         print("Yahoo JSON parse error:", e)
-    # dedupe
     seen_local = set(); uniq = []
     for it in results:
         key = (it.get("ticker","").upper(), it.get("published",""))
@@ -301,7 +325,6 @@ def fetch_upcoming_earnings(days=UPCOMING_DAYS):
         if items:
             out.extend(items)
         time.sleep(0.12)
-    # dedupe by ticker+published
     seen_local = set(); uniq = []
     for it in out:
         key = (it.get("ticker","").upper(), it.get("published",""))
@@ -309,12 +332,11 @@ def fetch_upcoming_earnings(days=UPCOMING_DAYS):
             seen_local.add(key); uniq.append(it)
     return uniq
 
-# ---------------- Per-ticker earnings (robust: JSON -> HTML scraping fallback) ----------------
+# ---------------- Per-ticker earnings (robust JSON -> HTML scraping fallback) ----------------
 def _parse_earnings_text_to_datetime(text):
     if not text:
         return None
     text = re.sub(r"\b(after|before) (market )?(close|open)\b", "", text, flags=re.IGNORECASE).strip()
-    # try ISO first
     m_iso = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
     if m_iso:
         try:
@@ -324,23 +346,17 @@ def _parse_earnings_text_to_datetime(text):
             return dt.astimezone(pytz.UTC)
         except Exception:
             pass
-    # Month Day, Year
     m = re.search(r"([A-Za-z]+ \d{1,2}, 20\d{2})", text)
     if m:
-        try:
-            dt = datetime.strptime(m.group(1), "%B %d, %Y")
-            return dt.replace(tzinfo=pytz.UTC)
-        except Exception:
+        for fmt in ("%B %d, %Y","%b %d, %Y"):
             try:
-                dt = datetime.strptime(m.group(1), "%b %d, %Y")
+                dt = datetime.strptime(m.group(1), fmt)
                 return dt.replace(tzinfo=pytz.UTC)
             except Exception:
                 pass
-    # Month Year -> use first of month
     m2 = re.search(r"([A-Za-z]+) (\b20\d{2}\b)", text)
     if m2:
-        mon = m2.group(1)
-        yr = int(m2.group(2))
+        mon = m2.group(1); yr = int(m2.group(2))
         for fmt in ("%B %d %Y","%b %d %Y"):
             try:
                 dt = datetime.strptime(f"{mon} 1 {yr}", fmt)
@@ -370,12 +386,9 @@ def _find_date_in_text_blob(text_blob):
             pass
     m3 = re.search(r"([A-Z][a-z]{2,8} 20\d{2})", text_blob)
     if m3:
-        try:
-            dt = datetime.strptime(m3.group(1), "%B %Y")
-            return dt.replace(tzinfo=pytz.UTC)
-        except Exception:
+        for fmt in ("%B %Y","%b %Y"):
             try:
-                dt = datetime.strptime(m3.group(1), "%b %Y")
+                dt = datetime.strptime(m3.group(1), fmt)
                 return dt.replace(tzinfo=pytz.UTC)
             except Exception:
                 pass
@@ -383,7 +396,10 @@ def _find_date_in_text_blob(text_blob):
 
 def fetch_earnings_for_ticker_yahoo(ticker):
     ticker = (ticker or "").upper()
-    # 1) try JSON endpoint quietly
+    if ticker in PER_TICKER_CACHE_FAIL:
+        return None
+
+    # Try JSON endpoint first (may be 401/403)
     json_url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=calendarEvents"
     j = safe_get_json(json_url)
     if j:
@@ -403,28 +419,43 @@ def fetch_earnings_for_ticker_yahoo(ticker):
                     dt = datetime.fromtimestamp(ts, pytz.UTC)
                     return {"ticker": ticker, "company": shortName, "earnings_dt": dt}
         except Exception as e:
-            print(f"[per-ticker json parse error {ticker}]:", e)
-    # 2) fallback: scrape the quote page for 'Earnings Date' text
+            print(f"[per-ticker json parse error {ticker}]: {e}")
+
+    # JSON failed or returned nothing -> scrape quote page
     quote_url = f"https://finance.yahoo.com/quote/{ticker}"
-    html = safe_get(quote_url)
-    if not html:
+    try:
+        r = requests.get(quote_url, timeout=15, headers={"User-Agent": USER_AGENT})
+        if r.status_code == 404:
+            PER_TICKER_STATS["page_404"] += 1
+            PER_TICKER_CACHE_FAIL[ticker] = "404"
+            print(f"[HTTP] GET 404 for {quote_url} (ticker likely invalid/delisted). Skipping.")
+            return None
+        if r.status_code >= 400:
+            PER_TICKER_STATS["page_other_errors"] += 1
+            PER_TICKER_CACHE_FAIL[ticker] = f"status_{r.status_code}"
+            print(f"[HTTP] GET error for {quote_url}: {r.status_code} {r.reason}")
+            return None
+        html = r.text
+    except Exception as e:
+        PER_TICKER_STATS["page_other_errors"] += 1
+        PER_TICKER_CACHE_FAIL[ticker] = "request_exception"
+        print(f"[HTTP] GET error for {quote_url}: {e}")
         return None
+
     soup = BeautifulSoup(html, "lxml")
-    # Heuristic: find nodes with "Earnings Date" and nearby value
+
+    # Heuristic: find 'Earnings Date' label and parse nearby text
     try:
         label_nodes = soup.find_all(string=re.compile(r"\bEarnings Date\b", flags=re.IGNORECASE))
         for node in label_nodes:
             parent = node.parent
-            # look for sibling value
             try:
-                # try parent -> sibling text
                 sib = parent.find_next_sibling()
                 if sib:
                     cand = sib.get_text(" ", strip=True)
                     dt = _parse_earnings_text_to_datetime(cand)
                     if dt:
                         return {"ticker": ticker, "company": None, "earnings_dt": dt}
-                # try parent parent block
                 grand = parent.find_parent()
                 if grand:
                     blob = grand.get_text(" ", strip=True)
@@ -435,11 +466,15 @@ def fetch_earnings_for_ticker_yahoo(ticker):
                 pass
     except Exception as e:
         print(f"[scrape heuristic error {ticker}]:", e)
-    # fallback: search whole page text
+
+    # fallback: search entire page
     txt = soup.get_text(" ", strip=True)
     dt = _find_date_in_text_blob(txt)
     if dt:
         return {"ticker": ticker, "company": None, "earnings_dt": dt}
+
+    # nothing found: cache minor failure for this run
+    PER_TICKER_CACHE_FAIL[ticker] = "not_found"
     return None
 
 # ---------------- AI detection & classification ----------------
@@ -634,7 +669,11 @@ def main():
                 })
                 found_cnt += 1
         time.sleep(0.12)  # polite throttle
+
+    # Print per-ticker stats for debugging
     print(f"Per-ticker checks completed: checked={checked_cnt}, found={found_cnt}")
+    print("Per-ticker HTTP stats:", PER_TICKER_STATS)
+    print("Per-ticker cache fail examples (first 10):", list(PER_TICKER_CACHE_FAIL.items())[:10])
 
     # merge & dedupe upcoming
     all_upcoming = upcoming + per_ticker_upcoming
@@ -678,9 +717,30 @@ def main():
 
     # Process universe in batches
     batches = list(chunk_list(universe, MAX_TICKERS))
-    print(f"Processing {len(batches)} batch(es) of up to {MAX_TICKERS} tickers (PROCESS_ALL_BATCHES={PROCESS_ALL_BATCHES})")
-    if not PROCESS_ALL_BATCHES and batches:
-        batches = [batches[0]]
+    print(f"Built {len(batches)} batch(es) of up to {MAX_TICKERS} tickers (PROCESS_ALL_BATCHES env raw='{os.getenv('PROCESS_ALL_BATCHES')}')")
+
+    # Ensure PROCESS_ALL_BATCHES is read correctly from environment as a boolean
+    process_all_env = os.getenv("PROCESS_ALL_BATCHES", str(PROCESS_ALL_BATCHES)).strip().lower()
+    process_all_flag = process_all_env in ("1", "true", "yes")
+
+    # Safety: if this was a manual run (workflow_dispatch) we default to single-batch
+    # unless the caller explicitly set FORCE_ALL_BATCHES=true in the run environment.
+    manual_run_flag = (os.getenv("GITHUB_EVENT_NAME", "") == "workflow_dispatch")
+    force_all_override = os.getenv("FORCE_ALL_BATCHES", "").strip().lower() in ("1","true","yes")
+
+    if manual_run_flag and not force_all_override:
+        # For manual tests: limit to first batch to avoid long runs
+        if batches:
+            print("Manual run detected and FORCE_ALL_BATCHES not set -> limiting to first batch only for safety.")
+            batches = [batches[0]]
+    else:
+        # Non-manual run: obey PROCESS_ALL_BATCHES env flag (default behavior)
+        if not process_all_flag:
+            if batches:
+                print("PROCESS_ALL_BATCHES is false -> limiting to first batch only.")
+                batches = [batches[0]]
+
+    print(f"Processing {len(batches)} batch(es) after applying flags (manual_run={manual_run_flag}, process_all={process_all_flag}, force_all_override={force_all_override})")
 
     for batch_index, batch in enumerate(batches, start=1):
         print(f"Batch {batch_index}/{len(batches)} — tickers in this batch: {len(batch)}")
