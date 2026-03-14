@@ -53,6 +53,7 @@ jobs:
           DAILY_DIGEST_HOUR_MORNING: '5'
           DAILY_DIGEST_HOUR_EVENING: '18'
           MAX_TICKERS: '200'
+          PROCESS_ALL_BATCHES: 'false'
           THROTTLE_SECONDS: '0.4'
           RECENT_DAYS: '2'
           UPCOMING_DAYS: '5'
