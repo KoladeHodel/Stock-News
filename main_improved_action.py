@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-main_improved_action.py — final with:
- - batch processing to cover all tickers (process universe in sequential chunks of MAX_TICKERS)
- - robust upcoming earnings: global Yahoo calendar JSON/HTML + per-ticker Yahoo quoteSummary calendarEvents
- - morning-only upcoming earnings (not marked seen)
- - telegram splitting + full-email attachment
- - manual workflow_dispatch support (MANUAL_MODE)
+main_improved_action.py — drop-in final with robust per-ticker earnings (JSON -> HTML scrape fallback),
+aggressive per-ticker supplement, batch processing across full universe, telegram splitter, and full-email attachment.
+
+Drop this file into your repo (overwrite existing main_improved_action.py) and push.
 """
 
 import os
@@ -93,7 +91,6 @@ def safe_get_json(url, timeout=15):
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        # don't spam error
         print(f"[HTTP JSON] GET error for {url}: {e}")
         return None
 
@@ -213,14 +210,14 @@ def poll_feed(url):
         print("feedparser error for", url, e)
         return []
 
-# ---------------- Yahoo earnings (robust) ----------------
+# ---------------- Yahoo calendar (global) ----------------
 def fetch_yahoo_earnings_for_date_json(date_iso):
     url = f"https://query1.finance.yahoo.com/v7/finance/calendar/earnings?day={date_iso}"
+    data = safe_get_json(url)
+    if not data:
+        return []
+    results = []
     try:
-        data = safe_get_json(url)
-        if not data:
-            return []
-        results = []
         calendar = data.get("calendar") or {}
         if isinstance(calendar, dict) and "result" in calendar:
             res = calendar.get("result")
@@ -245,6 +242,7 @@ def fetch_yahoo_earnings_for_date_json(date_iso):
                     title = f"Earnings scheduled: {sym} ({name}) {time_of_day}".strip()
                     results.append({"title": title, "link": url, "published": date_iso, "ticker": sym, "company": name})
         if not results:
+            # fallback: walk JSON to find likely earnings entries
             def walk_find(obj):
                 found = []
                 if isinstance(obj, dict):
@@ -261,16 +259,15 @@ def fetch_yahoo_earnings_for_date_json(date_iso):
                             found.extend(walk_find(v))
                 return found
             results = walk_find(data)
-        # dedupe
-        seen_local = set(); uniq = []
-        for it in results:
-            key = (it.get("title",""), it.get("link",""))
-            if key not in seen_local:
-                seen_local.add(key); uniq.append(it)
-        return uniq
     except Exception as e:
-        print("Yahoo JSON earnings fetch failed:", e)
-        return []
+        print("Yahoo JSON parse error:", e)
+    # dedupe
+    seen_local = set(); uniq = []
+    for it in results:
+        key = (it.get("ticker","").upper(), it.get("published",""))
+        if key not in seen_local:
+            seen_local.add(key); uniq.append(it)
+    return uniq
 
 def fetch_yahoo_earnings_for_date_html(date_iso):
     url = f"https://finance.yahoo.com/calendar/earnings?day={date_iso}"
@@ -286,7 +283,6 @@ def fetch_yahoo_earnings_for_date_html(date_iso):
             if len(tds) >= 6:
                 ticker = tds[0].get_text(strip=True)
                 name = tds[1].get_text(strip=True)
-                eps_est = tds[2].get_text(strip=True)
                 time_of_day = tds[4].get_text(strip=True)
                 title = f"Earnings scheduled: {ticker} ({name}) {time_of_day}"
                 items.append({"title": title, "link": url, "published": date_iso, "ticker": ticker, "company": name})
@@ -305,49 +301,145 @@ def fetch_upcoming_earnings(days=UPCOMING_DAYS):
         if items:
             out.extend(items)
         time.sleep(0.12)
-    # dedupe
+    # dedupe by ticker+published
     seen_local = set(); uniq = []
     for it in out:
-        key = (it.get("title",""), it.get("link",""))
+        key = (it.get("ticker","").upper(), it.get("published",""))
         if key not in seen_local:
             seen_local.add(key); uniq.append(it)
     return uniq
 
-# ---------------- Per-ticker earnings (Yahoo quoteSummary calendarEvents) ----------------
-def fetch_earnings_for_ticker_yahoo(ticker):
-    """
-    Fetch next earnings date for a ticker from Yahoo quoteSummary calendarEvents.
-    Returns dict {ticker, company, next_earnings_date_iso, title, link} or None.
-    """
-    url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=calendarEvents"
-    data = safe_get_json(url)
-    if not data:
+# ---------------- Per-ticker earnings (robust: JSON -> HTML scraping fallback) ----------------
+def _parse_earnings_text_to_datetime(text):
+    if not text:
         return None
-    # navigate to calendarEvents -> earnings -> earningsDate
-    try:
-        # typical path: data['quoteSummary']['result'][0]['calendarEvents']['earnings']['earningsDate']
-        q = data.get("quoteSummary", {}).get("result")
-        if isinstance(q, list) and q:
-            ev = q[0].get("calendarEvents", {}).get("earnings", {})
-            ed = ev.get("earningsDate")
-            shortName = q[0].get("shortName") or q[0].get("symbol") or ticker
-            if ed:
-                # earningsDate can be list of timestamps or dict
-                # handle list [ { "raw": <unix> }, ... ] or single dict
+    text = re.sub(r"\b(after|before) (market )?(close|open)\b", "", text, flags=re.IGNORECASE).strip()
+    # try ISO first
+    m_iso = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
+    if m_iso:
+        try:
+            dt = datetime.fromisoformat(m_iso.group(1))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=pytz.UTC)
+            return dt.astimezone(pytz.UTC)
+        except Exception:
+            pass
+    # Month Day, Year
+    m = re.search(r"([A-Za-z]+ \d{1,2}, 20\d{2})", text)
+    if m:
+        try:
+            dt = datetime.strptime(m.group(1), "%B %d, %Y")
+            return dt.replace(tzinfo=pytz.UTC)
+        except Exception:
+            try:
+                dt = datetime.strptime(m.group(1), "%b %d, %Y")
+                return dt.replace(tzinfo=pytz.UTC)
+            except Exception:
+                pass
+    # Month Year -> use first of month
+    m2 = re.search(r"([A-Za-z]+) (\b20\d{2}\b)", text)
+    if m2:
+        mon = m2.group(1)
+        yr = int(m2.group(2))
+        for fmt in ("%B %d %Y","%b %d %Y"):
+            try:
+                dt = datetime.strptime(f"{mon} 1 {yr}", fmt)
+                return dt.replace(tzinfo=pytz.UTC)
+            except Exception:
+                pass
+    return None
+
+def _find_date_in_text_blob(text_blob):
+    if not text_blob:
+        return None
+    m = re.search(r"(20\d{2}-\d{2}-\d{2})", text_blob)
+    if m:
+        try:
+            dt = datetime.fromisoformat(m.group(1))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=pytz.UTC)
+            return dt.astimezone(pytz.UTC)
+        except Exception:
+            pass
+    m2 = re.search(r"([A-Z][a-z]+ \d{1,2}, 20\d{2})", text_blob)
+    if m2:
+        try:
+            dt = datetime.strptime(m2.group(1), "%B %d, %Y")
+            return dt.replace(tzinfo=pytz.UTC)
+        except Exception:
+            pass
+    m3 = re.search(r"([A-Z][a-z]{2,8} 20\d{2})", text_blob)
+    if m3:
+        try:
+            dt = datetime.strptime(m3.group(1), "%B %Y")
+            return dt.replace(tzinfo=pytz.UTC)
+        except Exception:
+            try:
+                dt = datetime.strptime(m3.group(1), "%b %Y")
+                return dt.replace(tzinfo=pytz.UTC)
+            except Exception:
+                pass
+    return None
+
+def fetch_earnings_for_ticker_yahoo(ticker):
+    ticker = (ticker or "").upper()
+    # 1) try JSON endpoint quietly
+    json_url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=calendarEvents"
+    j = safe_get_json(json_url)
+    if j:
+        try:
+            q = j.get("quoteSummary", {}).get("result")
+            if isinstance(q, list) and q:
+                ev = q[0].get("calendarEvents", {}).get("earnings", {})
+                ed = ev.get("earningsDate")
+                shortName = q[0].get("shortName") or q[0].get("symbol") or ticker
                 ts = None
-                if isinstance(ed, list) and ed:
-                    if isinstance(ed[0], dict) and "raw" in ed[0]:
+                if ed:
+                    if isinstance(ed, list) and ed and isinstance(ed[0], dict) and "raw" in ed[0]:
                         ts = int(ed[0]["raw"])
-                elif isinstance(ed, dict) and "raw" in ed:
-                    ts = int(ed["raw"])
+                    elif isinstance(ed, dict) and "raw" in ed:
+                        ts = int(ed["raw"])
                 if ts:
                     dt = datetime.fromtimestamp(ts, pytz.UTC)
-                    # produce ISO date
-                    return {"ticker": ticker, "company": shortName, "earnings_ts": ts, "earnings_dt": dt, "link": url}
-    except Exception as e:
-        # ignore parse errors
-        # print("per-ticker earnings parse error", ticker, e)
+                    return {"ticker": ticker, "company": shortName, "earnings_dt": dt}
+        except Exception as e:
+            print(f"[per-ticker json parse error {ticker}]:", e)
+    # 2) fallback: scrape the quote page for 'Earnings Date' text
+    quote_url = f"https://finance.yahoo.com/quote/{ticker}"
+    html = safe_get(quote_url)
+    if not html:
         return None
+    soup = BeautifulSoup(html, "lxml")
+    # Heuristic: find nodes with "Earnings Date" and nearby value
+    try:
+        label_nodes = soup.find_all(string=re.compile(r"\bEarnings Date\b", flags=re.IGNORECASE))
+        for node in label_nodes:
+            parent = node.parent
+            # look for sibling value
+            try:
+                # try parent -> sibling text
+                sib = parent.find_next_sibling()
+                if sib:
+                    cand = sib.get_text(" ", strip=True)
+                    dt = _parse_earnings_text_to_datetime(cand)
+                    if dt:
+                        return {"ticker": ticker, "company": None, "earnings_dt": dt}
+                # try parent parent block
+                grand = parent.find_parent()
+                if grand:
+                    blob = grand.get_text(" ", strip=True)
+                    dt = _find_date_in_text_blob(blob)
+                    if dt:
+                        return {"ticker": ticker, "company": None, "earnings_dt": dt}
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[scrape heuristic error {ticker}]:", e)
+    # fallback: search whole page text
+    txt = soup.get_text(" ", strip=True)
+    dt = _find_date_in_text_blob(txt)
+    if dt:
+        return {"ticker": ticker, "company": None, "earnings_dt": dt}
     return None
 
 # ---------------- AI detection & classification ----------------
@@ -387,7 +479,7 @@ def is_scandal_after_launch(title, summary):
     ]
     return any(re.search(p, txt) for p in patterns)
 
-# ---------------- Notify digest helpers (telegram splitter + full email attachment) ----------------
+# ---------------- Notify digest helpers ----------------
 def notify_telegram_digest(text):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         print("[Telegram missing] would send digest length:", len(text))
@@ -457,7 +549,6 @@ def send_email(subject, full_text):
 
 # ---------------- Utilities for batching ----------------
 def chunk_list(lst, n):
-    """Yield successive chunks of size n from lst."""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
@@ -493,7 +584,7 @@ def main():
     seen = load_json_set(SEEN_FILE)
     morning_snapshot = load_json_set(MORNING_SNAPSHOT_FILE)
 
-    # Build universe (S&P500 + NASDAQ-100) once
+    # Build universe once
     sp = get_sp500_list()
     nas = get_nasdaq100_list()
     combined = sp + nas
@@ -506,54 +597,64 @@ def main():
     total = len(universe)
     print(f"Universe total tickers: {total}")
 
-    # Fetch upcoming earnings via calendar + per-ticker supplement
+    # 1) calendar-based upcoming earnings
     upcoming = fetch_upcoming_earnings(UPCOMING_DAYS)
     print(f"DEBUG: calendar-based upcoming earnings fetched: {len(upcoming)} items.")
 
-    # Per-ticker supplement: for tickers not in upcoming, check per-ticker calendarEvents
-    # Only do this if we intend to process all batches (PROCESS_ALL_BATCHES) — otherwise limit to selected chunk later
+    # 2) aggressive per-ticker supplement
     per_ticker_upcoming = []
-    # Build set of tickers already present in upcoming
-    existing_tickers = set()
-    for it in upcoming:
-        t = (it.get("ticker") or "").upper()
-        if t:
-            existing_tickers.add(t)
-    # We'll check all tickers — but throttle to avoid hammering; this can be adjusted
-    print("Starting per-ticker earnings checks (may take a while)...")
+    existing_tickers = set((it.get("ticker") or "").upper() for it in upcoming if it.get("ticker"))
+    need_full_check = (len(upcoming) < max(3, min(20, len(universe)//30)))
+    if need_full_check:
+        print(f"Calendar returned {len(upcoming)} items — performing FULL per-ticker earnings checks across {len(universe)} tickers")
+    else:
+        print(f"Calendar returned {len(upcoming)} items — performing selective per-ticker checks for tickers not present in calendar")
+
+    checked_cnt = 0
+    found_cnt = 0
+    now_utc = datetime.now(pytz.UTC)
     for ticker, name in universe:
         tk = ticker.upper()
-        if tk in existing_tickers:
+        if not need_full_check and tk in existing_tickers:
             continue
         res = fetch_earnings_for_ticker_yahoo(tk)
+        checked_cnt += 1
         if res and "earnings_dt" in res:
-            # check within UPCOMING_DAYS window
-            now = datetime.now(pytz.UTC)
-            if 0 <= (res["earnings_dt"] - now).days <= UPCOMING_DAYS:
-                title = f"Earnings scheduled: {res['ticker']} ({res.get('company','')}) {res['earnings_dt'].astimezone(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d')}"
-                per_ticker_upcoming.append({"title": title, "link": f"https://finance.yahoo.com/quote/{tk}/calendar?p={tk}", "published": res['earnings_dt'].strftime("%Y-%m-%d"), "ticker": tk, "company": res.get("company")})
-        # polite pause
-        time.sleep(0.08)
-    print(f"DEBUG: per-ticker upcoming earnings found: {len(per_ticker_upcoming)} items.")
-    # merge per-ticker results into upcoming (dedupe)
+            edt = res["earnings_dt"]
+            delta_days = (edt - now_utc).total_seconds() / 86400.0
+            if 0 <= delta_days <= UPCOMING_DAYS:
+                published_iso = edt.astimezone(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
+                title = f"Earnings scheduled: {res['ticker']} ({res.get('company','')}) {published_iso}"
+                per_ticker_upcoming.append({
+                    "title": title,
+                    "link": f"https://finance.yahoo.com/quote/{tk}/calendar?p={tk}",
+                    "published": published_iso,
+                    "ticker": tk,
+                    "company": res.get("company") or name
+                })
+                found_cnt += 1
+        time.sleep(0.12)  # polite throttle
+    print(f"Per-ticker checks completed: checked={checked_cnt}, found={found_cnt}")
+
+    # merge & dedupe upcoming
     all_upcoming = upcoming + per_ticker_upcoming
     dedup_upcoming = []
     seen_u = set()
     for it in all_upcoming:
-        key = (it.get("ticker","").upper(), it.get("published",""))
+        key = ((it.get("ticker") or "").upper(), it.get("published",""))
         if key not in seen_u:
             seen_u.add(key)
             dedup_upcoming.append(it)
     upcoming = dedup_upcoming
-    print(f"DEBUG: total upcoming earnings after per-ticker supplement: {len(upcoming)} items. Sample: {upcoming[:3]}")
+    print(f"DEBUG: total upcoming earnings after per-ticker supplement: {len(upcoming)} items. Sample: {upcoming[:6]}")
 
-    # If not digest hour and not manual: exit early (cheap)
+    # If not digest hour and not manual: exit early
     if not (is_morning or is_evening):
         print(f"Not a digest hour and not manual. Exiting. local_hour={local_hour}")
         save_json_set(SEEN_FILE, seen)
         return
 
-    # Prepare categories accumulation across batches
+    # Prepare categories
     categories = {
         "upcoming_earnings": [],
         "ai_special": [],
@@ -564,7 +665,7 @@ def main():
     }
     added_this_run = set()
 
-    # Include upcoming earnings in morning only (do NOT mark as seen)
+    # include upcoming earnings in morning only (do NOT mark seen)
     if is_morning:
         for it in upcoming:
             categories["upcoming_earnings"].append({
@@ -575,16 +676,14 @@ def main():
                 "company": it.get("company")
             })
 
-    # Process universe in batches of MAX_TICKERS sequentially (so one run covers all tickers)
+    # Process universe in batches
     batches = list(chunk_list(universe, MAX_TICKERS))
     print(f"Processing {len(batches)} batch(es) of up to {MAX_TICKERS} tickers (PROCESS_ALL_BATCHES={PROCESS_ALL_BATCHES})")
-    # If PROCESS_ALL_BATCHES is false, only process the first batch (preserves old rotated behavior)
     if not PROCESS_ALL_BATCHES and batches:
         batches = [batches[0]]
 
     for batch_index, batch in enumerate(batches, start=1):
         print(f"Batch {batch_index}/{len(batches)} — tickers in this batch: {len(batch)}")
-        # build feeds for this batch
         feeds = [(t, n, build_google_news_rss(t, n)) for (t, n) in batch]
         for ticker, cname, rss in feeds:
             entries = poll_feed(rss)
@@ -623,7 +722,6 @@ def main():
                     categories["takeover"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
                     continue
             time.sleep(THROTTLE_SECONDS)
-        # after batch: small pause to be polite
         if batch_index < len(batches):
             print(f"Completed batch {batch_index}; sleeping briefly before next batch...")
             time.sleep(1.2)
@@ -671,17 +769,14 @@ def main():
             notify_telegram_digest(message)
             if SMTP_HOST and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO:
                 send_email("Morning Focused Market Digest", message)
-        # Save morning snapshot (full seen set after morning)
         save_json_set(MORNING_SNAPSHOT_FILE, seen)
         print("Morning snapshot saved.")
 
     elif is_evening:
-        # delta = items added_this_run but not in morning_snapshot
         if not morning_snapshot:
             delta_fps = added_this_run.copy()
         else:
             delta_fps = {fp for fp in added_this_run if fp not in morning_snapshot}
-        # filter categories by delta_fps
         delta_categories = {k: [] for k in categories.keys()}
         def item_fp(it):
             return fingerprint(it.get("title",""), it.get("link",""), it.get("published","") or "")
@@ -729,11 +824,9 @@ def main():
             notify_telegram_digest(message)
             if SMTP_HOST and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO:
                 send_email("Evening Delta Market Digest", message)
-        # update morning snapshot after evening run so next evening compares to new morning
         save_json_set(MORNING_SNAPSHOT_FILE, seen)
         print("Morning snapshot updated after evening run.")
 
-    # persist seen always
     save_json_set(SEEN_FILE, seen)
     print(f"Saved seen fingerprints: {len(seen)}")
     print("Done.")
