@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-main_improved_action.py — drop-in final with:
- - batch processing across universe (optionally single batch)
- - robust upcoming earnings (calendar + per-ticker JSON -> HTML fallback)
- - safe_get_json with HTTP status counters
- - per-ticker failure cache to avoid repeated retries
- - Telegram splitter (no truncation) + full-email attachment
- - morning-only upcoming earnings (not marked seen)
- - manual workflow_dispatch support (MANUAL_MODE)
+main_improved_action.py — Full drop-in final.
+Features:
+ - S&P500 + NASDAQ-100 universe
+ - Batch processing with safe manual-run single-batch guard
+ - PROCESS_ALL_BATCHES / FORCE_SINGLE_BATCH / FORCE_ALL_BATCHES controls
+ - Upcoming earnings: Yahoo calendar (global) + aggressive per-ticker (quoteSummary JSON -> HTML scrape fallback)
+ - Robust handling of 401/403/404 with per-run stats & per-ticker failure cache
+ - Morning full digest + Evening delta digest (morning snapshot)
+ - Telegram splitter and full-email attachment
+ - Defaults tuned for your requests: RECENT_DAYS=2, UPCOMING_DAYS=5
+Drop this file into your repo (overwrite existing main_improved_action.py) and push.
 """
 
 import os
@@ -40,8 +43,10 @@ DAILY_DIGEST_HOUR_MORNING = int(os.getenv("DAILY_DIGEST_HOUR_MORNING", "5"))
 DAILY_DIGEST_HOUR_EVENING = int(os.getenv("DAILY_DIGEST_HOUR_EVENING", "18"))
 THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "0.4"))
 USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (compatible; MarketAlerts/1.0)")
-RECENT_DAYS = int(os.getenv("RECENT_DAYS", "7"))
-UPCOMING_DAYS = int(os.getenv("UPCOMING_DAYS", "7"))
+
+# tuned per your request
+RECENT_DAYS = int(os.getenv("RECENT_DAYS", "2"))   # only recent news in last N days
+UPCOMING_DAYS = int(os.getenv("UPCOMING_DAYS", "5"))  # upcoming earnings window
 
 CACHE_DIR = ".cache"
 SEEN_FILE = os.path.join(CACHE_DIR, "seen.json")
@@ -64,7 +69,6 @@ PRODUCT_KEYWORDS = ["launch","launches","unveil","introduce","introduces","new p
 SCANDAL_KEYWORDS = ["scandal","allegation","fraud","lawsuit","investigation","probe","charged","indicted","recall"]
 DEAL_KEYWORDS = ["partnership","partners with","signs deal","strategic partnership","contract worth","agreement with","signed a deal"]
 MNA_KEYWORDS = ["acquir","acquisition","merger","takeover","s-4","will acquire","to buy","agrees to buy"]
-EARNINGS_KEYWORDS = ["earnings","quarterly results","eps","revenue","beats","misses"]
 
 # ---------------- per-run stats & caches ----------------
 PER_TICKER_STATS = {"json_401": 0, "json_403": 0, "page_404": 0, "page_other_errors": 0, "json_other": 0}
@@ -93,8 +97,8 @@ def safe_get(url, timeout=15):
 
 def safe_get_json(url, timeout=15):
     """
-    Improved safe JSON fetch that records 401/403/404 and other statuses in PER_TICKER_STATS,
-    returns None on error so callers will fall back to HTML scraping.
+    Improved safe JSON fetch that records 401/403/other statuses in PER_TICKER_STATS.
+    Returns None on error so callers fall back to HTML scraping.
     """
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     try:
@@ -443,8 +447,6 @@ def fetch_earnings_for_ticker_yahoo(ticker):
         return None
 
     soup = BeautifulSoup(html, "lxml")
-
-    # Heuristic: find 'Earnings Date' label and parse nearby text
     try:
         label_nodes = soup.find_all(string=re.compile(r"\bEarnings Date\b", flags=re.IGNORECASE))
         for node in label_nodes:
@@ -467,13 +469,11 @@ def fetch_earnings_for_ticker_yahoo(ticker):
     except Exception as e:
         print(f"[scrape heuristic error {ticker}]:", e)
 
-    # fallback: search entire page
     txt = soup.get_text(" ", strip=True)
     dt = _find_date_in_text_blob(txt)
     if dt:
         return {"ticker": ticker, "company": None, "earnings_dt": dt}
 
-    # nothing found: cache minor failure for this run
     PER_TICKER_CACHE_FAIL[ticker] = "not_found"
     return None
 
@@ -589,6 +589,7 @@ def chunk_list(lst, n):
 
 # ---------------- Main ----------------
 def main():
+    # basic preflight
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         print("ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID required.")
         return
@@ -597,7 +598,7 @@ def main():
     now_local = datetime.now(tz)
     local_hour = now_local.hour
 
-    # Manual-run detection & override
+    # Manual-run detection & override via workflow_dispatch or MANUAL_MODE env
     github_event_name = os.getenv("GITHUB_EVENT_NAME", "")
     manual_mode_env = os.getenv("MANUAL_MODE", "")
     manual_run = (github_event_name == "workflow_dispatch")
@@ -687,7 +688,7 @@ def main():
     upcoming = dedup_upcoming
     print(f"DEBUG: total upcoming earnings after per-ticker supplement: {len(upcoming)} items. Sample: {upcoming[:6]}")
 
-    # If not digest hour and not manual: exit early
+    # If not digest hour and not manual: exit early (cheap)
     if not (is_morning or is_evening):
         print(f"Not a digest hour and not manual. Exiting. local_hour={local_hour}")
         save_json_set(SEEN_FILE, seen)
@@ -715,32 +716,40 @@ def main():
                 "company": it.get("company")
             })
 
-    # Process universe in batches
+    # ---------------- Safe batching selection ----------------
+    # Print commit/ref + event name so we can confirm which code & run flags the job actually sees
+    print("GITHUB_REF:", os.getenv("GITHUB_REF"), "GITHUB_SHA:", os.getenv("GITHUB_SHA"), "GITHUB_EVENT_NAME:", os.getenv("GITHUB_EVENT_NAME"))
+
     batches = list(chunk_list(universe, MAX_TICKERS))
-    print(f"Built {len(batches)} batch(es) of up to {MAX_TICKERS} tickers (PROCESS_ALL_BATCHES env raw='{os.getenv('PROCESS_ALL_BATCHES')}')")
+    print(f"Built {len(batches)} batch(es) of up to {MAX_TICKERS} tickers (raw PROCESS_ALL_BATCHES env='{os.getenv('PROCESS_ALL_BATCHES')}', FORCE_SINGLE_BATCH='{os.getenv('FORCE_SINGLE_BATCH')}', FORCE_ALL_BATCHES='{os.getenv('FORCE_ALL_BATCHES')}').")
 
-    # Ensure PROCESS_ALL_BATCHES is read correctly from environment as a boolean
-    process_all_env = os.getenv("PROCESS_ALL_BATCHES", str(PROCESS_ALL_BATCHES)).strip().lower()
-    process_all_flag = process_all_env in ("1", "true", "yes")
+    def parse_bool_env(name, default=False):
+        v = os.getenv(name, None)
+        if v is None:
+            return default
+        return str(v).strip().lower() in ("1","true","yes","on")
 
-    # Safety: if this was a manual run (workflow_dispatch) we default to single-batch
-    # unless the caller explicitly set FORCE_ALL_BATCHES=true in the run environment.
+    process_all_flag = parse_bool_env("PROCESS_ALL_BATCHES", PROCESS_ALL_BATCHES)
+    force_single = parse_bool_env("FORCE_SINGLE_BATCH", False)
+    force_all_override = parse_bool_env("FORCE_ALL_BATCHES", False)
     manual_run_flag = (os.getenv("GITHUB_EVENT_NAME", "") == "workflow_dispatch")
-    force_all_override = os.getenv("FORCE_ALL_BATCHES", "").strip().lower() in ("1","true","yes")
 
-    if manual_run_flag and not force_all_override:
-        # For manual tests: limit to first batch to avoid long runs
+    if force_single:
+        if batches:
+            print("FORCE_SINGLE_BATCH=true -> limiting to first batch only for safety.")
+            batches = [batches[0]]
+    elif manual_run_flag and not force_all_override:
         if batches:
             print("Manual run detected and FORCE_ALL_BATCHES not set -> limiting to first batch only for safety.")
             batches = [batches[0]]
+    elif not process_all_flag:
+        if batches:
+            print("PROCESS_ALL_BATCHES is false -> limiting to first batch only.")
+            batches = [batches[0]]
     else:
-        # Non-manual run: obey PROCESS_ALL_BATCHES env flag (default behavior)
-        if not process_all_flag:
-            if batches:
-                print("PROCESS_ALL_BATCHES is false -> limiting to first batch only.")
-                batches = [batches[0]]
+        print("No single-batch override detected -> processing all batches in this run.")
 
-    print(f"Processing {len(batches)} batch(es) after applying flags (manual_run={manual_run_flag}, process_all={process_all_flag}, force_all_override={force_all_override})")
+    print(f"Processing {len(batches)} batch(es) after applying flags (manual_run={manual_run_flag}, process_all={process_all_flag}, force_single={force_single}, force_all_override={force_all_override})")
 
     for batch_index, batch in enumerate(batches, start=1):
         print(f"Batch {batch_index}/{len(batches)} — tickers in this batch: {len(batch)}")
