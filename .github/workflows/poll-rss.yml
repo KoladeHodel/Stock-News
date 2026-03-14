@@ -1,10 +1,10 @@
-name: Poll S&P500 (US stocks) & Alerts (no-persist)
+name: Poll US Market (S&P500 + NASDAQ100) & Alerts (no-persist)
 
 on:
   schedule:
     # every 30 minutes
     - cron: '*/30 * * * *'
-    # daily digest at 08:00 Europe/Paris -> 07:00 UTC (adjust if you want)
+    # daily digest at 08:00 Europe/Paris -> 07:00 UTC (adjust if you need different alignment)
     - cron: '0 7 * * *'
   workflow_dispatch: {}
 
@@ -12,26 +12,27 @@ jobs:
   run-poll:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install runtime dependencies
         run: |
           python -m pip install --upgrade pip
           pip install feedparser requests pytz beautifulsoup4 lxml
 
-      - name: Run poll script
+      - name: Run improved poller
+        # ensure the script file is named main_improved_action.py in repository root
         env:
-          # TELEGRAM: required (token + chat id)
+          # REQUIRED (Telegram)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-          # Optional: Slack webhook or SMTP for email alerts
+          # Optional additional channels
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -39,9 +40,10 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
 
-          # Tuning
+          # Tuning (change as desired)
           TIMEZONE: Europe/Paris
           DAILY_DIGEST_HOUR: '8'
-          MAX_TICKERS: '200'   # how many S&P500 tickers to process (default 200). Increase if you want more.
+          MAX_TICKERS: '300'      # default tickers processed per run (tweakable)
+          THROTTLE_SECONDS: '0.4' # pause between feed polls to be polite
         run: |
-          python main_sp500_action.py
+          python main_improved_action.py
