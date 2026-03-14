@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 """
-main_improved_action.py (final — telegram splitter + robust email attachment)
-
-Features:
- - Morning full digest @ 05:00 Europe/Paris (configurable via DAILY_DIGEST_HOUR_MORNING)
- - Evening delta digest @ 18:00 Europe/Paris (configurable via DAILY_DIGEST_HOUR_EVENING)
- - Manual trigger support: workflow_dispatch with input 'mode' -> MANUAL_MODE env
- - Robust upcoming earnings fetch (Yahoo JSON -> fallback HTML)
- - Upcoming earnings shown in morning only, NOT marked as seen (so they reappear each morning)
- - RECENT_DAYS controls news recency; UPCOMING_DAYS controls upcoming earnings window
- - Persistent cache: .cache/seen.json and .cache/morning_snapshot.json (actions/cache used in workflow)
- - One Telegram message per digest (split into chunks if long); full email with attachment
- - Improved AI intentional-investment detection via regex patterns
+main_improved_action.py — final with:
+ - batch processing to cover all tickers (process universe in sequential chunks of MAX_TICKERS)
+ - robust upcoming earnings: global Yahoo calendar JSON/HTML + per-ticker Yahoo quoteSummary calendarEvents
+ - morning-only upcoming earnings (not marked seen)
+ - telegram splitting + full-email attachment
+ - manual workflow_dispatch support (MANUAL_MODE)
 """
 
 import os
@@ -38,7 +32,8 @@ SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO")
 
-MAX_TICKERS = int(os.getenv("MAX_TICKERS", "200"))
+MAX_TICKERS = int(os.getenv("MAX_TICKERS", "200"))   # per-batch size
+PROCESS_ALL_BATCHES = os.getenv("PROCESS_ALL_BATCHES", "true").lower() in ("1","true","yes")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Paris")
 DAILY_DIGEST_HOUR_MORNING = int(os.getenv("DAILY_DIGEST_HOUR_MORNING", "5"))
 DAILY_DIGEST_HOUR_EVENING = int(os.getenv("DAILY_DIGEST_HOUR_EVENING", "18"))
@@ -89,6 +84,17 @@ def safe_get(url, timeout=15):
         return r.text
     except Exception as e:
         print(f"[HTTP] GET error for {url}: {e}")
+        return None
+
+def safe_get_json(url, timeout=15):
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    try:
+        r = requests.get(url, timeout=timeout, headers=headers)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        # don't spam error
+        print(f"[HTTP JSON] GET error for {url}: {e}")
         return None
 
 def load_json_set(path):
@@ -207,14 +213,13 @@ def poll_feed(url):
         print("feedparser error for", url, e)
         return []
 
-# ---------------- Yahoo earnings (robust JSON + HTML fallback) ----------------
+# ---------------- Yahoo earnings (robust) ----------------
 def fetch_yahoo_earnings_for_date_json(date_iso):
     url = f"https://query1.finance.yahoo.com/v7/finance/calendar/earnings?day={date_iso}"
     try:
-        headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-        r = requests.get(url, headers=headers, timeout=15)
-        r.raise_for_status()
-        data = r.json()
+        data = safe_get_json(url)
+        if not data:
+            return []
         results = []
         calendar = data.get("calendar") or {}
         if isinstance(calendar, dict) and "result" in calendar:
@@ -256,6 +261,7 @@ def fetch_yahoo_earnings_for_date_json(date_iso):
                             found.extend(walk_find(v))
                 return found
             results = walk_find(data)
+        # dedupe
         seen_local = set(); uniq = []
         for it in results:
             key = (it.get("title",""), it.get("link",""))
@@ -298,13 +304,51 @@ def fetch_upcoming_earnings(days=UPCOMING_DAYS):
             items = fetch_yahoo_earnings_for_date_html(day)
         if items:
             out.extend(items)
-        time.sleep(0.15)
+        time.sleep(0.12)
+    # dedupe
     seen_local = set(); uniq = []
     for it in out:
         key = (it.get("title",""), it.get("link",""))
         if key not in seen_local:
             seen_local.add(key); uniq.append(it)
     return uniq
+
+# ---------------- Per-ticker earnings (Yahoo quoteSummary calendarEvents) ----------------
+def fetch_earnings_for_ticker_yahoo(ticker):
+    """
+    Fetch next earnings date for a ticker from Yahoo quoteSummary calendarEvents.
+    Returns dict {ticker, company, next_earnings_date_iso, title, link} or None.
+    """
+    url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=calendarEvents"
+    data = safe_get_json(url)
+    if not data:
+        return None
+    # navigate to calendarEvents -> earnings -> earningsDate
+    try:
+        # typical path: data['quoteSummary']['result'][0]['calendarEvents']['earnings']['earningsDate']
+        q = data.get("quoteSummary", {}).get("result")
+        if isinstance(q, list) and q:
+            ev = q[0].get("calendarEvents", {}).get("earnings", {})
+            ed = ev.get("earningsDate")
+            shortName = q[0].get("shortName") or q[0].get("symbol") or ticker
+            if ed:
+                # earningsDate can be list of timestamps or dict
+                # handle list [ { "raw": <unix> }, ... ] or single dict
+                ts = None
+                if isinstance(ed, list) and ed:
+                    if isinstance(ed[0], dict) and "raw" in ed[0]:
+                        ts = int(ed[0]["raw"])
+                elif isinstance(ed, dict) and "raw" in ed:
+                    ts = int(ed["raw"])
+                if ts:
+                    dt = datetime.fromtimestamp(ts, pytz.UTC)
+                    # produce ISO date
+                    return {"ticker": ticker, "company": shortName, "earnings_ts": ts, "earnings_dt": dt, "link": url}
+    except Exception as e:
+        # ignore parse errors
+        # print("per-ticker earnings parse error", ticker, e)
+        return None
+    return None
 
 # ---------------- AI detection & classification ----------------
 def detect_ai_intent(title, summary):
@@ -345,10 +389,6 @@ def is_scandal_after_launch(title, summary):
 
 # ---------------- Notify digest helpers (telegram splitter + full email attachment) ----------------
 def notify_telegram_digest(text):
-    """
-    Send a digest to Telegram, splitting into multiple messages if length exceeds
-    Telegram limits (~4096). We conservatively split at 3800 chars.
-    """
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         print("[Telegram missing] would send digest length:", len(text))
         return
@@ -386,11 +426,6 @@ def notify_telegram_digest(text):
             print("Telegram send error (chunk):", e)
 
 def send_email(subject, full_text):
-    """
-    Send a full HTML email and attach the full_text as a .txt file.
-    - subject: email subject string
-    - full_text: plain text full digest
-    """
     if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO):
         print("Email not sent (SMTP not configured).")
         return
@@ -419,6 +454,12 @@ def send_email(subject, full_text):
         print("Email sent successfully.")
     except Exception as e:
         print("Email send error:", e)
+
+# ---------------- Utilities for batching ----------------
+def chunk_list(lst, n):
+    """Yield successive chunks of size n from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
 # ---------------- Main ----------------
 def main():
@@ -452,17 +493,7 @@ def main():
     seen = load_json_set(SEEN_FILE)
     morning_snapshot = load_json_set(MORNING_SNAPSHOT_FILE)
 
-    # Fetch upcoming earnings (robust). Debug print for logs.
-    upcoming = fetch_upcoming_earnings(UPCOMING_DAYS)
-    print(f"DEBUG: upcoming earnings fetched: {len(upcoming)} items. Sample: {upcoming[:3]}")
-
-    # If not digest hour and not manual, exit early (cheap)
-    if not (is_morning or is_evening):
-        print(f"Not a digest hour and not manual. Exiting. local_hour={local_hour}")
-        save_json_set(SEEN_FILE, seen)
-        return
-
-    # Build universe (S&P500 + NASDAQ-100) and rotation
+    # Build universe (S&P500 + NASDAQ-100) once
     sp = get_sp500_list()
     nas = get_nasdaq100_list()
     combined = sp + nas
@@ -473,28 +504,56 @@ def main():
             uniq[key] = (t, n)
     universe = list(uniq.values())
     total = len(universe)
-    if total == 0:
-        print("No tickers found; exiting.")
+    print(f"Universe total tickers: {total}")
+
+    # Fetch upcoming earnings via calendar + per-ticker supplement
+    upcoming = fetch_upcoming_earnings(UPCOMING_DAYS)
+    print(f"DEBUG: calendar-based upcoming earnings fetched: {len(upcoming)} items.")
+
+    # Per-ticker supplement: for tickers not in upcoming, check per-ticker calendarEvents
+    # Only do this if we intend to process all batches (PROCESS_ALL_BATCHES) — otherwise limit to selected chunk later
+    per_ticker_upcoming = []
+    # Build set of tickers already present in upcoming
+    existing_tickers = set()
+    for it in upcoming:
+        t = (it.get("ticker") or "").upper()
+        if t:
+            existing_tickers.add(t)
+    # We'll check all tickers — but throttle to avoid hammering; this can be adjusted
+    print("Starting per-ticker earnings checks (may take a while)...")
+    for ticker, name in universe:
+        tk = ticker.upper()
+        if tk in existing_tickers:
+            continue
+        res = fetch_earnings_for_ticker_yahoo(tk)
+        if res and "earnings_dt" in res:
+            # check within UPCOMING_DAYS window
+            now = datetime.now(pytz.UTC)
+            if 0 <= (res["earnings_dt"] - now).days <= UPCOMING_DAYS:
+                title = f"Earnings scheduled: {res['ticker']} ({res.get('company','')}) {res['earnings_dt'].astimezone(pytz.timezone(TIMEZONE)).strftime('%Y-%m-%d')}"
+                per_ticker_upcoming.append({"title": title, "link": f"https://finance.yahoo.com/quote/{tk}/calendar?p={tk}", "published": res['earnings_dt'].strftime("%Y-%m-%d"), "ticker": tk, "company": res.get("company")})
+        # polite pause
+        time.sleep(0.08)
+    print(f"DEBUG: per-ticker upcoming earnings found: {len(per_ticker_upcoming)} items.")
+    # merge per-ticker results into upcoming (dedupe)
+    all_upcoming = upcoming + per_ticker_upcoming
+    dedup_upcoming = []
+    seen_u = set()
+    for it in all_upcoming:
+        key = (it.get("ticker","").upper(), it.get("published",""))
+        if key not in seen_u:
+            seen_u.add(key)
+            dedup_upcoming.append(it)
+    upcoming = dedup_upcoming
+    print(f"DEBUG: total upcoming earnings after per-ticker supplement: {len(upcoming)} items. Sample: {upcoming[:3]}")
+
+    # If not digest hour and not manual: exit early (cheap)
+    if not (is_morning or is_evening):
+        print(f"Not a digest hour and not manual. Exiting. local_hour={local_hour}")
+        save_json_set(SEEN_FILE, seen)
         return
 
-    run_num = os.getenv("GITHUB_RUN_NUMBER")
-    run_index = int(run_num) if run_num and run_num.isdigit() else int(time.time() // (60*30))
-    chunk_size = max(1, min(MAX_TICKERS, total))
-    offset = (run_index * chunk_size) % total
-
-    def slice_window(lst, off, size):
-        if size >= len(lst): return lst
-        end = off + size
-        if end <= len(lst):
-            return lst[off:end]
-        return lst[off:len(lst)] + lst[0:end - len(lst)]
-
-    selected = slice_window(universe, offset, chunk_size)
-    print(f"Universe size: {total}, processing {len(selected)} tickers (offset {offset}).")
-
-    feeds = [(t, n, build_google_news_rss(t, n)) for (t, n) in selected]
-
-    # categories
+    # Prepare categories accumulation across batches
     categories = {
         "upcoming_earnings": [],
         "ai_special": [],
@@ -503,10 +562,9 @@ def main():
         "major_deal": [],
         "takeover": []
     }
-
     added_this_run = set()
 
-    # include upcoming earnings in morning only; DO NOT mark them as 'seen' or add to added_this_run
+    # Include upcoming earnings in morning only (do NOT mark as seen)
     if is_morning:
         for it in upcoming:
             categories["upcoming_earnings"].append({
@@ -517,43 +575,58 @@ def main():
                 "company": it.get("company")
             })
 
-    # poll feeds and collect items (respect RECENT_DAYS)
-    for ticker, cname, rss in feeds:
-        entries = poll_feed(rss)
-        if not entries:
-            time.sleep(THROTTLE_SECONDS); continue
-        for entry in entries:
-            if not is_recent_entry(entry, tz, RECENT_DAYS):
+    # Process universe in batches of MAX_TICKERS sequentially (so one run covers all tickers)
+    batches = list(chunk_list(universe, MAX_TICKERS))
+    print(f"Processing {len(batches)} batch(es) of up to {MAX_TICKERS} tickers (PROCESS_ALL_BATCHES={PROCESS_ALL_BATCHES})")
+    # If PROCESS_ALL_BATCHES is false, only process the first batch (preserves old rotated behavior)
+    if not PROCESS_ALL_BATCHES and batches:
+        batches = [batches[0]]
+
+    for batch_index, batch in enumerate(batches, start=1):
+        print(f"Batch {batch_index}/{len(batches)} — tickers in this batch: {len(batch)}")
+        # build feeds for this batch
+        feeds = [(t, n, build_google_news_rss(t, n)) for (t, n) in batch]
+        for ticker, cname, rss in feeds:
+            entries = poll_feed(rss)
+            if not entries:
+                time.sleep(THROTTLE_SECONDS)
                 continue
-            title = entry.get("title","") or ""
-            link = entry.get("link","") or ""
-            summary = entry.get("summary","") or entry.get("description","") or ""
-            published = entry.get("published") or entry.get("updated") or ""
-            fp = fingerprint(title, link, published)
-            if fp in seen:
-                continue
-            label = classify(title, summary)
-            if label == "ai_special":
-                seen.add(fp); added_this_run.add(fp)
-                categories["ai_special"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
-                continue
-            if label == "product_launch":
-                seen.add(fp); added_this_run.add(fp)
-                categories["product_launch"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
-                continue
-            if label == "scandal" and is_scandal_after_launch(title, summary):
-                seen.add(fp); added_this_run.add(fp)
-                categories["scandal_after_launch"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
-                continue
-            if label == "major_deal":
-                seen.add(fp); added_this_run.add(fp)
-                categories["major_deal"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
-                continue
-            if label == "takeover":
-                seen.add(fp); added_this_run.add(fp)
-                categories["takeover"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
-                continue
-        time.sleep(THROTTLE_SECONDS)
+            for entry in entries:
+                if not is_recent_entry(entry, tz, RECENT_DAYS):
+                    continue
+                title = entry.get("title","") or ""
+                link = entry.get("link","") or ""
+                summary = entry.get("summary","") or entry.get("description","") or ""
+                published = entry.get("published") or entry.get("updated") or ""
+                fp = fingerprint(title, link, published)
+                if fp in seen:
+                    continue
+                label = classify(title, summary)
+                if label == "ai_special":
+                    seen.add(fp); added_this_run.add(fp)
+                    categories["ai_special"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
+                    continue
+                if label == "product_launch":
+                    seen.add(fp); added_this_run.add(fp)
+                    categories["product_launch"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
+                    continue
+                if label == "scandal" and is_scandal_after_launch(title, summary):
+                    seen.add(fp); added_this_run.add(fp)
+                    categories["scandal_after_launch"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
+                    continue
+                if label == "major_deal":
+                    seen.add(fp); added_this_run.add(fp)
+                    categories["major_deal"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
+                    continue
+                if label == "takeover":
+                    seen.add(fp); added_this_run.add(fp)
+                    categories["takeover"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
+                    continue
+            time.sleep(THROTTLE_SECONDS)
+        # after batch: small pause to be polite
+        if batch_index < len(batches):
+            print(f"Completed batch {batch_index}; sleeping briefly before next batch...")
+            time.sleep(1.2)
 
     # Build & send digests
     if is_morning:
@@ -561,43 +634,41 @@ def main():
         if total_new == 0:
             print("Morning: no new items to send.")
         else:
-            header = f"📊 Morning Focused Digest — {now_local.strftime('%Y-%m-%d %H:%M %Z')}\nProcessed {len(selected)} tickers.\nNew items: {total_new}\n\n"
+            header = f"📊 Morning Focused Digest — {now_local.strftime('%Y-%m-%d %H:%M %Z')}\nProcessed {total} tickers across {len(batches)} batch(es).\nNew items: {total_new}\n\n"
             parts = [header]
             if categories["upcoming_earnings"]:
                 parts.append(f"💰 Upcoming earnings (next {UPCOMING_DAYS} days)\n")
-                for it in categories["upcoming_earnings"][:80]:
+                for it in categories["upcoming_earnings"][:400]:
                     ticker_str = (it.get("ticker") or "").strip()
                     parts.append(f"• {ticker_str} {it['title']}\n" if ticker_str else f"• {it['title']}\n")
                 parts.append("\n")
             if categories["ai_special"]:
                 parts.append("🧠 AI Intentional Investments / Partnerships\n")
-                for it in categories["ai_special"][:40]:
+                for it in categories["ai_special"][:400]:
                     parts.append(f"• {it['ticker']} — {it['title']}\n")
                 parts.append("\n")
             if categories["product_launch"]:
                 parts.append("🚀 Product Launches\n")
-                for it in categories["product_launch"][:40]:
+                for it in categories["product_launch"][:400]:
                     parts.append(f"• {it['ticker']} — {it['title']}\n")
                 parts.append("\n")
             if categories["scandal_after_launch"]:
                 parts.append("⚠️ Scandals linked to product launches/events\n")
-                for it in categories["scandal_after_launch"][:40]:
+                for it in categories["scandal_after_launch"][:400]:
                     parts.append(f"• {it['ticker']} — {it['title']}\n")
                 parts.append("\n")
             if categories["major_deal"]:
                 parts.append("🤝 Major Deals / Partnerships\n")
-                for it in categories["major_deal"][:40]:
+                for it in categories["major_deal"][:400]:
                     parts.append(f"• {it['ticker']} — {it['title']}\n")
                 parts.append("\n")
             if categories["takeover"]:
                 parts.append("🏢 M&A / Takeovers\n")
-                for it in categories["takeover"][:40]:
+                for it in categories["takeover"][:400]:
                     parts.append(f"• {it['ticker']} — {it['title']}\n")
                 parts.append("\n")
             message = "".join(parts)
-            # send via Telegram (split if needed)
             notify_telegram_digest(message)
-            # send full email with attachment if configured
             if SMTP_HOST and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO:
                 send_email("Morning Focused Market Digest", message)
         # Save morning snapshot (full seen set after morning)
@@ -622,36 +693,36 @@ def main():
         if total_delta == 0:
             print("Evening: no new delta items since morning snapshot. No message sent.")
         else:
-            header = f"📊 Evening Delta Digest — {now_local.strftime('%Y-%m-%d %H:%M %Z')}\nProcessed {len(selected)} tickers.\nNew since morning: {total_delta}\n\n"
+            header = f"📊 Evening Delta Digest — {now_local.strftime('%Y-%m-%d %H:%M %Z')}\nProcessed {total} tickers across {len(batches)} batch(es).\nNew since morning: {total_delta}\n\n"
             parts = [header]
             if delta_categories["upcoming_earnings"]:
                 parts.append(f"💰 Upcoming earnings (next {UPCOMING_DAYS} days)\n")
-                for it in delta_categories["upcoming_earnings"][:80]:
+                for it in delta_categories["upcoming_earnings"][:400]:
                     parts.append(f"• {it['title']}\n")
                 parts.append("\n")
             if delta_categories["ai_special"]:
                 parts.append("🧠 AI Intentional Investments / Partnerships (new)\n")
-                for it in delta_categories["ai_special"][:40]:
+                for it in delta_categories["ai_special"][:400]:
                     parts.append(f"• {it['ticker']} — {it['title']}\n")
                 parts.append("\n")
             if delta_categories["product_launch"]:
                 parts.append("🚀 Product Launches (new)\n")
-                for it in delta_categories["product_launch"][:40]:
+                for it in delta_categories["product_launch"][:400]:
                     parts.append(f"• {it['ticker']} — {it['title']}\n")
                 parts.append("\n")
             if delta_categories["scandal_after_launch"]:
                 parts.append("⚠️ Scandals linked to launches/events (new)\n")
-                for it in delta_categories["scandal_after_launch"][:40]:
+                for it in delta_categories["scandal_after_launch"][:400]:
                     parts.append(f"• {it['ticker']} — {it['title']}\n")
                 parts.append("\n")
             if delta_categories["major_deal"]:
                 parts.append("🤝 Major Deals / Partnerships (new)\n")
-                for it in delta_categories["major_deal"][:40]:
+                for it in delta_categories["major_deal"][:400]:
                     parts.append(f"• {it['ticker']} — {it['title']}\n")
                 parts.append("\n")
             if delta_categories["takeover"]:
                 parts.append("🏢 M&A / Takeovers (new)\n")
-                for it in delta_categories["takeover"][:40]:
+                for it in delta_categories["takeover"][:400]:
                     parts.append(f"• {it['ticker']} — {it['title']}\n")
                 parts.append("\n")
             message = "".join(parts)
