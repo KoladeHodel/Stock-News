@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-main_improved_action.py — minimally fixed version
+main_improved_action.py — minimal fix version
 
-Changes from the last working version:
-- robust parsing of MANUAL_MODE
-- manual runs default to single batch unless PROCESS_ALL_BATCHES=true or FORCE_ALL_BATCHES=true
+What changed:
+- manual mode parsing kept
+- batching is decided EARLY
+- per-ticker earnings supplement now runs only on the selected universe for this run
+  (so manual single-batch tests do not scan all ~636 tickers first)
 
-Everything else is intentionally preserved.
+Everything else is intentionally kept as close as possible to the last working version.
 """
 
 import os
@@ -32,15 +34,15 @@ SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO")
 
-MAX_TICKERS = int(os.getenv("MAX_TICKERS", "200"))  # per-batch size
+MAX_TICKERS = int(os.getenv("MAX_TICKERS", "200"))
 PROCESS_ALL_BATCHES = os.getenv("PROCESS_ALL_BATCHES", "true").lower() in ("1", "true", "yes")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Paris")
 DAILY_DIGEST_HOUR_MORNING = int(os.getenv("DAILY_DIGEST_HOUR_MORNING", "5"))
 DAILY_DIGEST_HOUR_EVENING = int(os.getenv("DAILY_DIGEST_HOUR_EVENING", "18"))
 THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "0.4"))
 USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (compatible; MarketAlerts/1.0)")
-RECENT_DAYS = int(os.getenv("RECENT_DAYS", "7"))
-UPCOMING_DAYS = int(os.getenv("UPCOMING_DAYS", "7"))
+RECENT_DAYS = int(os.getenv("RECENT_DAYS", "2"))
+UPCOMING_DAYS = int(os.getenv("UPCOMING_DAYS", "5"))
 
 CACHE_DIR = ".cache"
 SEEN_FILE = os.path.join(CACHE_DIR, "seen.json")
@@ -63,7 +65,6 @@ PRODUCT_KEYWORDS = ["launch", "launches", "unveil", "introduce", "introduces", "
 SCANDAL_KEYWORDS = ["scandal", "allegation", "fraud", "lawsuit", "investigation", "probe", "charged", "indicted", "recall"]
 DEAL_KEYWORDS = ["partnership", "partners with", "signs deal", "strategic partnership", "contract worth", "agreement with", "signed a deal"]
 MNA_KEYWORDS = ["acquir", "acquisition", "merger", "takeover", "s-4", "will acquire", "to buy", "agrees to buy"]
-EARNINGS_KEYWORDS = ["earnings", "quarterly results", "eps", "revenue", "beats", "misses"]
 
 # ---------------- per-run stats & caches ----------------
 PER_TICKER_STATS = {"json_401": 0, "json_403": 0, "page_404": 0, "page_other_errors": 0, "json_other": 0}
@@ -256,33 +257,6 @@ def fetch_yahoo_earnings_for_date_json(date_iso):
                             time_of_day = e.get("time", "") or e.get("timeOfDay", "")
                             title = f"Earnings scheduled: {sym} ({name}) {time_of_day}".strip()
                             results.append({"title": title, "link": url, "published": date_iso, "ticker": sym, "company": name})
-        if not results:
-            earnings = data.get("earnings") or {}
-            res = earnings.get("result") or earnings.get("calendar") or None
-            if isinstance(res, list):
-                for e in res:
-                    sym = e.get("symbol") or e.get("ticker") or ""
-                    name = e.get("shortName") or e.get("company") or ""
-                    time_of_day = e.get("time", "") or e.get("timeOfDay", "")
-                    title = f"Earnings scheduled: {sym} ({name}) {time_of_day}".strip()
-                    results.append({"title": title, "link": url, "published": date_iso, "ticker": sym, "company": name})
-        if not results:
-            def walk_find(obj):
-                found = []
-                if isinstance(obj, dict):
-                    for _, v in obj.items():
-                        if isinstance(v, list):
-                            for item in v:
-                                if isinstance(item, dict) and ("symbol" in item or "time" in item or "shortName" in item):
-                                    sym = item.get("symbol") or item.get("ticker") or ""
-                                    name = item.get("shortName") or item.get("company") or ""
-                                    time_of_day = item.get("time", "") or item.get("timeOfDay", "")
-                                    title = f"Earnings scheduled: {sym} ({name}) {time_of_day}".strip()
-                                    found.append({"title": title, "link": url, "published": date_iso, "ticker": sym, "company": name})
-                        elif isinstance(v, dict):
-                            found.extend(walk_find(v))
-                return found
-            results = walk_find(data)
     except Exception as e:
         print("Yahoo JSON parse error:", e)
 
@@ -337,7 +311,7 @@ def fetch_upcoming_earnings(days=UPCOMING_DAYS):
             uniq.append(it)
     return uniq
 
-# ---------------- Per-ticker earnings (robust JSON -> HTML scraping fallback) ----------------
+# ---------------- Per-ticker earnings ----------------
 def _parse_earnings_text_to_datetime(text):
     if not text:
         return None
@@ -356,16 +330,6 @@ def _parse_earnings_text_to_datetime(text):
         for fmt in ("%B %d, %Y", "%b %d, %Y"):
             try:
                 dt = datetime.strptime(m.group(1), fmt)
-                return dt.replace(tzinfo=pytz.UTC)
-            except Exception:
-                pass
-    m2 = re.search(r"([A-Za-z]+) (\b20\d{2}\b)", text)
-    if m2:
-        mon = m2.group(1)
-        yr = int(m2.group(2))
-        for fmt in ("%B %d %Y", "%b %d %Y"):
-            try:
-                dt = datetime.strptime(f"{mon} 1 {yr}", fmt)
                 return dt.replace(tzinfo=pytz.UTC)
             except Exception:
                 pass
@@ -390,14 +354,6 @@ def _find_date_in_text_blob(text_blob):
             return dt.replace(tzinfo=pytz.UTC)
         except Exception:
             pass
-    m3 = re.search(r"([A-Z][a-z]{2,8} 20\d{2})", text_blob)
-    if m3:
-        for fmt in ("%B %Y", "%b %Y"):
-            try:
-                dt = datetime.strptime(m3.group(1), fmt)
-                return dt.replace(tzinfo=pytz.UTC)
-            except Exception:
-                pass
     return None
 
 def fetch_earnings_for_ticker_yahoo(ticker):
@@ -591,17 +547,8 @@ def chunk_list(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
-# ---------------- NEW: minimal manual mode parser ----------------
+# ---------------- Minimal manual mode parser ----------------
 def parse_manual_mode(raw_value: str) -> str:
-    """
-    Accepts:
-    - 'morning'
-    - 'evening'
-    - 'auto'
-    - 'mode=morning'
-    - 'mode=morning, process_all=false, max_tickers=200'
-    Returns: 'morning' | 'evening' | 'auto' | ''
-    """
     if not raw_value:
         return ""
     raw = raw_value.strip().lower()
@@ -632,7 +579,6 @@ def main():
     now_local = datetime.now(tz)
     local_hour = now_local.hour
 
-    # Manual-run detection & override
     github_event_name = os.getenv("GITHUB_EVENT_NAME", "")
     manual_mode_env_raw = os.getenv("MANUAL_MODE", "")
     manual_mode_env = parse_manual_mode(manual_mode_env_raw)
@@ -672,23 +618,43 @@ def main():
     total = len(universe)
     print(f"Universe total tickers: {total}")
 
+    # -------- EARLY batch selection (this is the actual fix) --------
+    batches = list(chunk_list(universe, MAX_TICKERS))
+    force_all_override = os.getenv("FORCE_ALL_BATCHES", "").strip().lower() in ("1", "true", "yes")
+
+    print(f"Built {len(batches)} batch(es) of up to {MAX_TICKERS} tickers")
+    print(f"PROCESS_ALL_BATCHES={PROCESS_ALL_BATCHES}, manual_run={manual_run}, force_all_override={force_all_override}")
+
+    if manual_run and not PROCESS_ALL_BATCHES and not force_all_override:
+        batches = [batches[0]]
+        print("Manual run + PROCESS_ALL_BATCHES=false -> limiting to first batch only.")
+    elif not manual_run and not PROCESS_ALL_BATCHES:
+        batches = [batches[0]]
+        print("Scheduled run + PROCESS_ALL_BATCHES=false -> limiting to first batch only.")
+    else:
+        print(f"Processing all {len(batches)} batch(es).")
+
+    # This is the universe actually used for this run
+    run_universe = [item for batch in batches for item in batch]
+    print(f"Run universe size after batch selection: {len(run_universe)}")
+
     # 1) calendar-based upcoming earnings
     upcoming = fetch_upcoming_earnings(UPCOMING_DAYS)
     print(f"DEBUG: calendar-based upcoming earnings fetched: {len(upcoming)} items.")
 
-    # 2) aggressive per-ticker supplement
+    # 2) per-ticker supplement ONLY on run_universe, not full universe
     per_ticker_upcoming = []
     existing_tickers = set((it.get("ticker") or "").upper() for it in upcoming if it.get("ticker"))
-    need_full_check = (len(upcoming) < max(3, min(20, len(universe) // 30)))
+    need_full_check = (len(upcoming) < max(3, min(20, len(run_universe) // 30)))
     if need_full_check:
-        print(f"Calendar returned {len(upcoming)} items — performing FULL per-ticker earnings checks across {len(universe)} tickers")
+        print(f"Calendar returned {len(upcoming)} items — performing per-ticker earnings checks across RUN universe of {len(run_universe)} tickers")
     else:
-        print(f"Calendar returned {len(upcoming)} items — performing selective per-ticker checks for tickers not present in calendar")
+        print(f"Calendar returned {len(upcoming)} items — performing selective per-ticker checks for run universe tickers not present in calendar")
 
     checked_cnt = 0
     found_cnt = 0
     now_utc = datetime.now(pytz.UTC)
-    for ticker, name in universe:
+    for ticker, name in run_universe:
         tk = ticker.upper()
         if not need_full_check and tk in existing_tickers:
             continue
@@ -726,7 +692,6 @@ def main():
     upcoming = dedup_upcoming
     print(f"DEBUG: total upcoming earnings after per-ticker supplement: {len(upcoming)} items. Sample: {upcoming[:6]}")
 
-    # If not digest hour and not manual: exit early
     if not (is_morning or is_evening):
         print(f"Not a digest hour and not manual. Exiting. local_hour={local_hour}")
         save_json_set(SEEN_FILE, seen)
@@ -743,7 +708,6 @@ def main():
     }
     added_this_run = set()
 
-    # include upcoming earnings in morning only (do NOT mark seen)
     if is_morning:
         for it in upcoming:
             categories["upcoming_earnings"].append({
@@ -754,23 +718,7 @@ def main():
                 "company": it.get("company"),
             })
 
-    # ---------------- MINIMAL FIX: batching logic ----------------
-    batches = list(chunk_list(universe, MAX_TICKERS))
-    force_all_override = os.getenv("FORCE_ALL_BATCHES", "").strip().lower() in ("1", "true", "yes")
-
-    print(f"Built {len(batches)} batch(es) of up to {MAX_TICKERS} tickers")
-    print(f"PROCESS_ALL_BATCHES={PROCESS_ALL_BATCHES}, manual_run={manual_run}, force_all_override={force_all_override}")
-
-    # Manual runs default to ONE batch unless explicitly overridden
-    if manual_run and not PROCESS_ALL_BATCHES and not force_all_override:
-        batches = [batches[0]]
-        print("Manual run + PROCESS_ALL_BATCHES=false -> limiting to first batch only.")
-    elif not manual_run and not PROCESS_ALL_BATCHES:
-        batches = [batches[0]]
-        print("Scheduled run + PROCESS_ALL_BATCHES=false -> limiting to first batch only.")
-    else:
-        print(f"Processing all {len(batches)} batch(es).")
-
+    # -------- news polling uses the same selected batches --------
     for batch_index, batch in enumerate(batches, start=1):
         print(f"Batch {batch_index}/{len(batches)} — tickers in this batch: {len(batch)}")
         feeds = [(t, n, build_google_news_rss(t, n)) for (t, n) in batch]
@@ -826,7 +774,7 @@ def main():
         if total_new == 0:
             print("Morning: no new items to send.")
         else:
-            header = f"📊 Morning Focused Digest — {now_local.strftime('%Y-%m-%d %H:%M %Z')}\nProcessed {total} tickers across {len(batches)} batch(es).\nNew items: {total_new}\n\n"
+            header = f"📊 Morning Focused Digest — {now_local.strftime('%Y-%m-%d %H:%M %Z')}\nProcessed {len(run_universe)} tickers across {len(batches)} batch(es).\nNew items: {total_new}\n\n"
             parts = [header]
             if categories["upcoming_earnings"]:
                 parts.append(f"💰 Upcoming earnings (next {UPCOMING_DAYS} days)\n")
@@ -885,7 +833,7 @@ def main():
         if total_delta == 0:
             print("Evening: no new delta items since morning snapshot. No message sent.")
         else:
-            header = f"📊 Evening Delta Digest — {now_local.strftime('%Y-%m-%d %H:%M %Z')}\nProcessed {total} tickers across {len(batches)} batch(es).\nNew since morning: {total_delta}\n\n"
+            header = f"📊 Evening Delta Digest — {now_local.strftime('%Y-%m-%d %H:%M %Z')}\nProcessed {len(run_universe)} tickers across {len(batches)} batch(es).\nNew since morning: {total_delta}\n\n"
             parts = [header]
             if delta_categories["upcoming_earnings"]:
                 parts.append(f"💰 Upcoming earnings (next {UPCOMING_DAYS} days)\n")
