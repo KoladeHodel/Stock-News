@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-main_improved_action.py — drop-in final with:
- - batch processing across universe (optionally single batch)
- - robust upcoming earnings (calendar + per-ticker JSON -> HTML fallback)
- - safe_get_json with HTTP status counters
- - per-ticker failure cache to avoid repeated retries
- - Telegram splitter (no truncation) + full-email attachment
- - morning-only upcoming earnings (not marked seen)
- - manual workflow_dispatch support (MANUAL_MODE)
+main_improved_action.py — minimally fixed version
+
+Changes from the last working version:
+- robust parsing of MANUAL_MODE
+- manual runs default to single batch unless PROCESS_ALL_BATCHES=true or FORCE_ALL_BATCHES=true
+
+Everything else is intentionally preserved.
 """
 
 import os
@@ -33,8 +32,8 @@ SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO")
 
-MAX_TICKERS = int(os.getenv("MAX_TICKERS", "200"))   # per-batch size
-PROCESS_ALL_BATCHES = os.getenv("PROCESS_ALL_BATCHES", "true").lower() in ("1","true","yes")
+MAX_TICKERS = int(os.getenv("MAX_TICKERS", "200"))  # per-batch size
+PROCESS_ALL_BATCHES = os.getenv("PROCESS_ALL_BATCHES", "true").lower() in ("1", "true", "yes")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Paris")
 DAILY_DIGEST_HOUR_MORNING = int(os.getenv("DAILY_DIGEST_HOUR_MORNING", "5"))
 DAILY_DIGEST_HOUR_EVENING = int(os.getenv("DAILY_DIGEST_HOUR_EVENING", "18"))
@@ -60,15 +59,15 @@ AI_INTENT_KEYPHRASES = [
     r"\b(integrat(es|ed|ing)?|powered by)\b.*\b(gpt|llm|large language model|openai|anthropic|gpt-4|gpt-4o)\b",
     r"\b(build(s|ing)?|develop(s|ing)?|deploy(s|ing)?)\b.*\b(large language model|llm|generative model|ai model)\b",
 ]
-PRODUCT_KEYWORDS = ["launch","launches","unveil","introduce","introduces","new product","releases","announces new","unveils"]
-SCANDAL_KEYWORDS = ["scandal","allegation","fraud","lawsuit","investigation","probe","charged","indicted","recall"]
-DEAL_KEYWORDS = ["partnership","partners with","signs deal","strategic partnership","contract worth","agreement with","signed a deal"]
-MNA_KEYWORDS = ["acquir","acquisition","merger","takeover","s-4","will acquire","to buy","agrees to buy"]
-EARNINGS_KEYWORDS = ["earnings","quarterly results","eps","revenue","beats","misses"]
+PRODUCT_KEYWORDS = ["launch", "launches", "unveil", "introduce", "introduces", "new product", "releases", "announces new", "unveils"]
+SCANDAL_KEYWORDS = ["scandal", "allegation", "fraud", "lawsuit", "investigation", "probe", "charged", "indicted", "recall"]
+DEAL_KEYWORDS = ["partnership", "partners with", "signs deal", "strategic partnership", "contract worth", "agreement with", "signed a deal"]
+MNA_KEYWORDS = ["acquir", "acquisition", "merger", "takeover", "s-4", "will acquire", "to buy", "agrees to buy"]
+EARNINGS_KEYWORDS = ["earnings", "quarterly results", "eps", "revenue", "beats", "misses"]
 
 # ---------------- per-run stats & caches ----------------
 PER_TICKER_STATS = {"json_401": 0, "json_403": 0, "page_404": 0, "page_other_errors": 0, "json_other": 0}
-PER_TICKER_CACHE_FAIL = {}  # ticker -> short reason for skipping further attempts this run
+PER_TICKER_CACHE_FAIL = {}
 
 # ---------------- Helpers ----------------
 def ensure_cache_dir():
@@ -92,10 +91,6 @@ def safe_get(url, timeout=15):
         return None
 
 def safe_get_json(url, timeout=15):
-    """
-    Improved safe JSON fetch that records 401/403/404 and other statuses in PER_TICKER_STATS,
-    returns None on error so callers will fall back to HTML scraping.
-    """
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     try:
         r = requests.get(url, timeout=timeout, headers=headers)
@@ -190,9 +185,10 @@ def get_sp500_list():
     table = soup.find("table", {"id": "constituents"}) or soup.find("table", class_="wikitable")
     out = []
     for tr in table.find_all("tr")[1:]:
-        cols = tr.find_all(["td","th"])
+        cols = tr.find_all(["td", "th"])
         if len(cols) >= 2:
-            ticker = cols[0].get_text(strip=True); name = cols[1].get_text(strip=True)
+            ticker = cols[0].get_text(strip=True)
+            name = cols[1].get_text(strip=True)
             out.append((ticker.replace(".", "-"), name))
     print(f"Fetched S&P500: {len(out)}")
     return out
@@ -206,23 +202,26 @@ def get_nasdaq100_list():
     out = []
     for table in soup.find_all("table", class_="wikitable"):
         for tr in table.find_all("tr")[1:]:
-            tds = tr.find_all(["td","th"])
+            tds = tr.find_all(["td", "th"])
             if len(tds) >= 2:
-                a = tds[0].get_text(strip=True); b = tds[1].get_text(strip=True)
+                a = tds[0].get_text(strip=True)
+                b = tds[1].get_text(strip=True)
                 if re.fullmatch(r"[A-Z0-9\.\-]{1,10}", b):
-                    name=a; ticker=b
+                    name = a
+                    ticker = b
                 elif re.fullmatch(r"[A-Z0-9\.\-]{1,10}", a):
-                    name=b; ticker=a
+                    name = b
+                    ticker = a
                 else:
                     continue
-                out.append((ticker.replace(".","-"), name))
+                out.append((ticker.replace(".", "-"), name))
     print(f"Fetched NASDAQ-100: {len(out)}")
     return out
 
 # ---------------- Build feed query & poll ----------------
 def build_google_news_rss(ticker, name):
     company_phrase = f'"{name}"'
-    q_terms = ["earnings","launch","product","partnership","invest","ai","gpu","acquire","merger","lawsuit","investigation"]
+    q_terms = ["earnings", "launch", "product", "partnership", "invest", "ai", "gpu", "acquire", "merger", "lawsuit", "investigation"]
     keywords_or = " OR ".join(q_terms)
     query = f"({ticker} OR {company_phrase}) ({keywords_or})"
     encoded = urllib.parse.quote(query)
@@ -254,7 +253,7 @@ def fetch_yahoo_earnings_for_date_json(date_iso):
                         for e in maybe:
                             sym = e.get("symbol") or e.get("ticker") or e.get("shortName") or ""
                             name = e.get("shortName") or e.get("company") or ""
-                            time_of_day = e.get("time", "") or e.get("timeOfDay","")
+                            time_of_day = e.get("time", "") or e.get("timeOfDay", "")
                             title = f"Earnings scheduled: {sym} ({name}) {time_of_day}".strip()
                             results.append({"title": title, "link": url, "published": date_iso, "ticker": sym, "company": name})
         if not results:
@@ -264,20 +263,20 @@ def fetch_yahoo_earnings_for_date_json(date_iso):
                 for e in res:
                     sym = e.get("symbol") or e.get("ticker") or ""
                     name = e.get("shortName") or e.get("company") or ""
-                    time_of_day = e.get("time", "") or e.get("timeOfDay","")
+                    time_of_day = e.get("time", "") or e.get("timeOfDay", "")
                     title = f"Earnings scheduled: {sym} ({name}) {time_of_day}".strip()
                     results.append({"title": title, "link": url, "published": date_iso, "ticker": sym, "company": name})
         if not results:
             def walk_find(obj):
                 found = []
                 if isinstance(obj, dict):
-                    for k,v in obj.items():
+                    for _, v in obj.items():
                         if isinstance(v, list):
                             for item in v:
                                 if isinstance(item, dict) and ("symbol" in item or "time" in item or "shortName" in item):
                                     sym = item.get("symbol") or item.get("ticker") or ""
                                     name = item.get("shortName") or item.get("company") or ""
-                                    time_of_day = item.get("time", "") or item.get("timeOfDay","")
+                                    time_of_day = item.get("time", "") or item.get("timeOfDay", "")
                                     title = f"Earnings scheduled: {sym} ({name}) {time_of_day}".strip()
                                     found.append({"title": title, "link": url, "published": date_iso, "ticker": sym, "company": name})
                         elif isinstance(v, dict):
@@ -286,11 +285,14 @@ def fetch_yahoo_earnings_for_date_json(date_iso):
             results = walk_find(data)
     except Exception as e:
         print("Yahoo JSON parse error:", e)
-    seen_local = set(); uniq = []
+
+    seen_local = set()
+    uniq = []
     for it in results:
-        key = (it.get("ticker","").upper(), it.get("published",""))
+        key = (it.get("ticker", "").upper(), it.get("published", ""))
         if key not in seen_local:
-            seen_local.add(key); uniq.append(it)
+            seen_local.add(key)
+            uniq.append(it)
     return uniq
 
 def fetch_yahoo_earnings_for_date_html(date_iso):
@@ -325,11 +327,14 @@ def fetch_upcoming_earnings(days=UPCOMING_DAYS):
         if items:
             out.extend(items)
         time.sleep(0.12)
-    seen_local = set(); uniq = []
+
+    seen_local = set()
+    uniq = []
     for it in out:
-        key = (it.get("ticker","").upper(), it.get("published",""))
+        key = (it.get("ticker", "").upper(), it.get("published", ""))
         if key not in seen_local:
-            seen_local.add(key); uniq.append(it)
+            seen_local.add(key)
+            uniq.append(it)
     return uniq
 
 # ---------------- Per-ticker earnings (robust JSON -> HTML scraping fallback) ----------------
@@ -348,7 +353,7 @@ def _parse_earnings_text_to_datetime(text):
             pass
     m = re.search(r"([A-Za-z]+ \d{1,2}, 20\d{2})", text)
     if m:
-        for fmt in ("%B %d, %Y","%b %d, %Y"):
+        for fmt in ("%B %d, %Y", "%b %d, %Y"):
             try:
                 dt = datetime.strptime(m.group(1), fmt)
                 return dt.replace(tzinfo=pytz.UTC)
@@ -356,8 +361,9 @@ def _parse_earnings_text_to_datetime(text):
                 pass
     m2 = re.search(r"([A-Za-z]+) (\b20\d{2}\b)", text)
     if m2:
-        mon = m2.group(1); yr = int(m2.group(2))
-        for fmt in ("%B %d %Y","%b %d %Y"):
+        mon = m2.group(1)
+        yr = int(m2.group(2))
+        for fmt in ("%B %d %Y", "%b %d %Y"):
             try:
                 dt = datetime.strptime(f"{mon} 1 {yr}", fmt)
                 return dt.replace(tzinfo=pytz.UTC)
@@ -386,7 +392,7 @@ def _find_date_in_text_blob(text_blob):
             pass
     m3 = re.search(r"([A-Z][a-z]{2,8} 20\d{2})", text_blob)
     if m3:
-        for fmt in ("%B %Y","%b %Y"):
+        for fmt in ("%B %Y", "%b %Y"):
             try:
                 dt = datetime.strptime(m3.group(1), fmt)
                 return dt.replace(tzinfo=pytz.UTC)
@@ -399,7 +405,6 @@ def fetch_earnings_for_ticker_yahoo(ticker):
     if ticker in PER_TICKER_CACHE_FAIL:
         return None
 
-    # Try JSON endpoint first (may be 401/403)
     json_url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=calendarEvents"
     j = safe_get_json(json_url)
     if j:
@@ -408,7 +413,7 @@ def fetch_earnings_for_ticker_yahoo(ticker):
             if isinstance(q, list) and q:
                 ev = q[0].get("calendarEvents", {}).get("earnings", {})
                 ed = ev.get("earningsDate")
-                shortName = q[0].get("shortName") or q[0].get("symbol") or ticker
+                short_name = q[0].get("shortName") or q[0].get("symbol") or ticker
                 ts = None
                 if ed:
                     if isinstance(ed, list) and ed and isinstance(ed[0], dict) and "raw" in ed[0]:
@@ -417,11 +422,10 @@ def fetch_earnings_for_ticker_yahoo(ticker):
                         ts = int(ed["raw"])
                 if ts:
                     dt = datetime.fromtimestamp(ts, pytz.UTC)
-                    return {"ticker": ticker, "company": shortName, "earnings_dt": dt}
+                    return {"ticker": ticker, "company": short_name, "earnings_dt": dt}
         except Exception as e:
             print(f"[per-ticker json parse error {ticker}]: {e}")
 
-    # JSON failed or returned nothing -> scrape quote page
     quote_url = f"https://finance.yahoo.com/quote/{ticker}"
     try:
         r = requests.get(quote_url, timeout=15, headers={"User-Agent": USER_AGENT})
@@ -443,8 +447,6 @@ def fetch_earnings_for_ticker_yahoo(ticker):
         return None
 
     soup = BeautifulSoup(html, "lxml")
-
-    # Heuristic: find 'Earnings Date' label and parse nearby text
     try:
         label_nodes = soup.find_all(string=re.compile(r"\bEarnings Date\b", flags=re.IGNORECASE))
         for node in label_nodes:
@@ -467,13 +469,11 @@ def fetch_earnings_for_ticker_yahoo(ticker):
     except Exception as e:
         print(f"[scrape heuristic error {ticker}]:", e)
 
-    # fallback: search entire page
     txt = soup.get_text(" ", strip=True)
     dt = _find_date_in_text_blob(txt)
     if dt:
         return {"ticker": ticker, "company": None, "earnings_dt": dt}
 
-    # nothing found: cache minor failure for this run
     PER_TICKER_CACHE_FAIL[ticker] = "not_found"
     return None
 
@@ -486,7 +486,7 @@ def detect_ai_intent(title, summary):
                 return True
         except re.error:
             continue
-    infra_terms = ["orders gpus","purchases gpus","buys gpus","orders a100","orders h100","announces ai lab","opens ai lab","builds ai team"]
+    infra_terms = ["orders gpus", "purchases gpus", "buys gpus", "orders a100", "orders h100", "announces ai lab", "opens ai lab", "builds ai team"]
     for t in infra_terms:
         if t in txt:
             return True
@@ -509,8 +509,10 @@ def classify(title, summary):
 def is_scandal_after_launch(title, summary):
     txt = (title + " " + (summary or "")).lower()
     patterns = [
-        r"post-?launch", r"after (the )?launch", r"following (the )?(release|launch|unveil|announcement)",
-        r"shortly after (the )?(release|launch|announcement|unveil)"
+        r"post-?launch",
+        r"after (the )?launch",
+        r"following (the )?(release|launch|unveil|announcement)",
+        r"shortly after (the )?(release|launch|announcement|unveil)",
     ]
     return any(re.search(p, txt) for p in patterns)
 
@@ -563,9 +565,11 @@ def send_email(subject, full_text):
         msg["From"] = SMTP_USER
         msg["To"] = ALERT_EMAIL_TO
 
-        html_body = "<html><body><pre style='font-family:monospace;white-space:pre-wrap;'>" + \
-                    (full_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")) + \
-                    "</pre></body></html>"
+        html_body = (
+            "<html><body><pre style='font-family:monospace;white-space:pre-wrap;'>"
+            + (full_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+            + "</pre></body></html>"
+        )
         msg.set_content(full_text)
         msg.add_alternative(html_body, subtype="html")
 
@@ -587,6 +591,37 @@ def chunk_list(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
+# ---------------- NEW: minimal manual mode parser ----------------
+def parse_manual_mode(raw_value: str) -> str:
+    """
+    Accepts:
+    - 'morning'
+    - 'evening'
+    - 'auto'
+    - 'mode=morning'
+    - 'mode=morning, process_all=false, max_tickers=200'
+    Returns: 'morning' | 'evening' | 'auto' | ''
+    """
+    if not raw_value:
+        return ""
+    raw = raw_value.strip().lower()
+
+    if raw in ("morning", "evening", "auto"):
+        return raw
+
+    match = re.search(r"mode\s*=\s*(morning|evening|auto)", raw)
+    if match:
+        return match.group(1)
+
+    if "morning" in raw:
+        return "morning"
+    if "evening" in raw:
+        return "evening"
+    if "auto" in raw:
+        return "auto"
+
+    return ""
+
 # ---------------- Main ----------------
 def main():
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
@@ -599,16 +634,21 @@ def main():
 
     # Manual-run detection & override
     github_event_name = os.getenv("GITHUB_EVENT_NAME", "")
-    manual_mode_env = os.getenv("MANUAL_MODE", "")
+    manual_mode_env_raw = os.getenv("MANUAL_MODE", "")
+    manual_mode_env = parse_manual_mode(manual_mode_env_raw)
     manual_run = (github_event_name == "workflow_dispatch")
 
+    print(f"MANUAL_MODE raw: {manual_mode_env_raw}")
+    print(f"MANUAL_MODE parsed: {manual_mode_env}")
+
     if manual_run:
-        mm = (manual_mode_env or "").strip().lower()
-        if mm == "evening":
-            is_morning = False; is_evening = True
+        if manual_mode_env == "evening":
+            is_morning = False
+            is_evening = True
             print("Manual run requested: EVENING (delta) mode.")
         else:
-            is_morning = True; is_evening = False
+            is_morning = True
+            is_evening = False
             print("Manual run requested: MORNING (full) mode.")
     else:
         is_morning = (local_hour == DAILY_DIGEST_HOUR_MORNING)
@@ -639,7 +679,7 @@ def main():
     # 2) aggressive per-ticker supplement
     per_ticker_upcoming = []
     existing_tickers = set((it.get("ticker") or "").upper() for it in upcoming if it.get("ticker"))
-    need_full_check = (len(upcoming) < max(3, min(20, len(universe)//30)))
+    need_full_check = (len(upcoming) < max(3, min(20, len(universe) // 30)))
     if need_full_check:
         print(f"Calendar returned {len(upcoming)} items — performing FULL per-ticker earnings checks across {len(universe)} tickers")
     else:
@@ -659,18 +699,17 @@ def main():
             delta_days = (edt - now_utc).total_seconds() / 86400.0
             if 0 <= delta_days <= UPCOMING_DAYS:
                 published_iso = edt.astimezone(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
-                title = f"Earnings scheduled: {res['ticker']} ({res.get('company','')}) {published_iso}"
+                title = f"Earnings scheduled: {res['ticker']} ({res.get('company', '')}) {published_iso}"
                 per_ticker_upcoming.append({
                     "title": title,
                     "link": f"https://finance.yahoo.com/quote/{tk}/calendar?p={tk}",
                     "published": published_iso,
                     "ticker": tk,
-                    "company": res.get("company") or name
+                    "company": res.get("company") or name,
                 })
                 found_cnt += 1
-        time.sleep(0.12)  # polite throttle
+        time.sleep(0.12)
 
-    # Print per-ticker stats for debugging
     print(f"Per-ticker checks completed: checked={checked_cnt}, found={found_cnt}")
     print("Per-ticker HTTP stats:", PER_TICKER_STATS)
     print("Per-ticker cache fail examples (first 10):", list(PER_TICKER_CACHE_FAIL.items())[:10])
@@ -680,7 +719,7 @@ def main():
     dedup_upcoming = []
     seen_u = set()
     for it in all_upcoming:
-        key = ((it.get("ticker") or "").upper(), it.get("published",""))
+        key = ((it.get("ticker") or "").upper(), it.get("published", ""))
         if key not in seen_u:
             seen_u.add(key)
             dedup_upcoming.append(it)
@@ -700,7 +739,7 @@ def main():
         "product_launch": [],
         "scandal_after_launch": [],
         "major_deal": [],
-        "takeover": []
+        "takeover": [],
     }
     added_this_run = set()
 
@@ -708,18 +747,29 @@ def main():
     if is_morning:
         for it in upcoming:
             categories["upcoming_earnings"].append({
-                "title": it.get("title",""),
-                "link": it.get("link",""),
-                "published": it.get("published",""),
+                "title": it.get("title", ""),
+                "link": it.get("link", ""),
+                "published": it.get("published", ""),
                 "ticker": it.get("ticker"),
-                "company": it.get("company")
+                "company": it.get("company"),
             })
 
-    # Process universe in batches
+    # ---------------- MINIMAL FIX: batching logic ----------------
     batches = list(chunk_list(universe, MAX_TICKERS))
-    print(f"Processing {len(batches)} batch(es) of up to {MAX_TICKERS} tickers (PROCESS_ALL_BATCHES={PROCESS_ALL_BATCHES})")
-    if not PROCESS_ALL_BATCHES and batches:
+    force_all_override = os.getenv("FORCE_ALL_BATCHES", "").strip().lower() in ("1", "true", "yes")
+
+    print(f"Built {len(batches)} batch(es) of up to {MAX_TICKERS} tickers")
+    print(f"PROCESS_ALL_BATCHES={PROCESS_ALL_BATCHES}, manual_run={manual_run}, force_all_override={force_all_override}")
+
+    # Manual runs default to ONE batch unless explicitly overridden
+    if manual_run and not PROCESS_ALL_BATCHES and not force_all_override:
         batches = [batches[0]]
+        print("Manual run + PROCESS_ALL_BATCHES=false -> limiting to first batch only.")
+    elif not manual_run and not PROCESS_ALL_BATCHES:
+        batches = [batches[0]]
+        print("Scheduled run + PROCESS_ALL_BATCHES=false -> limiting to first batch only.")
+    else:
+        print(f"Processing all {len(batches)} batch(es).")
 
     for batch_index, batch in enumerate(batches, start=1):
         print(f"Batch {batch_index}/{len(batches)} — tickers in this batch: {len(batch)}")
@@ -732,32 +782,37 @@ def main():
             for entry in entries:
                 if not is_recent_entry(entry, tz, RECENT_DAYS):
                     continue
-                title = entry.get("title","") or ""
-                link = entry.get("link","") or ""
-                summary = entry.get("summary","") or entry.get("description","") or ""
+                title = entry.get("title", "") or ""
+                link = entry.get("link", "") or ""
+                summary = entry.get("summary", "") or entry.get("description", "") or ""
                 published = entry.get("published") or entry.get("updated") or ""
                 fp = fingerprint(title, link, published)
                 if fp in seen:
                     continue
                 label = classify(title, summary)
                 if label == "ai_special":
-                    seen.add(fp); added_this_run.add(fp)
+                    seen.add(fp)
+                    added_this_run.add(fp)
                     categories["ai_special"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
                     continue
                 if label == "product_launch":
-                    seen.add(fp); added_this_run.add(fp)
+                    seen.add(fp)
+                    added_this_run.add(fp)
                     categories["product_launch"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
                     continue
                 if label == "scandal" and is_scandal_after_launch(title, summary):
-                    seen.add(fp); added_this_run.add(fp)
+                    seen.add(fp)
+                    added_this_run.add(fp)
                     categories["scandal_after_launch"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
                     continue
                 if label == "major_deal":
-                    seen.add(fp); added_this_run.add(fp)
+                    seen.add(fp)
+                    added_this_run.add(fp)
                     categories["major_deal"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
                     continue
                 if label == "takeover":
-                    seen.add(fp); added_this_run.add(fp)
+                    seen.add(fp)
+                    added_this_run.add(fp)
                     categories["takeover"].append({"ticker": ticker, "company": cname, "title": title, "link": link, "published": published})
                     continue
             time.sleep(THROTTLE_SECONDS)
@@ -817,12 +872,15 @@ def main():
         else:
             delta_fps = {fp for fp in added_this_run if fp not in morning_snapshot}
         delta_categories = {k: [] for k in categories.keys()}
+
         def item_fp(it):
-            return fingerprint(it.get("title",""), it.get("link",""), it.get("published","") or "")
+            return fingerprint(it.get("title", ""), it.get("link", ""), it.get("published", "") or "")
+
         for cat, items in categories.items():
             for it in items:
                 if item_fp(it) in delta_fps:
                     delta_categories[cat].append(it)
+
         total_delta = sum(len(v) for v in delta_categories.values())
         if total_delta == 0:
             print("Evening: no new delta items since morning snapshot. No message sent.")
