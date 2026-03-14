@@ -54,8 +54,8 @@ jobs:
           DAILY_DIGEST_HOUR_EVENING: '18'
           MAX_TICKERS: '200'
           THROTTLE_SECONDS: '0.4'
-          RECENT_DAYS: '7'
-          UPCOMING_DAYS: '7'
+          RECENT_DAYS: '3'
+          UPCOMING_DAYS: '5'
           # pass manual mode input to script (will be empty for scheduled runs)
           MANUAL_MODE: ${{ github.event.inputs.mode }}
         run: |
