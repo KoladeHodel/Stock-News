@@ -1,0 +1,47 @@
+name: Poll S&P500 (US stocks) & Alerts (no-persist)
+
+on:
+  schedule:
+    # every 30 minutes
+    - cron: '*/30 * * * *'
+    # daily digest at 08:00 Europe/Paris -> 07:00 UTC (adjust if you want)
+    - cron: '0 7 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  run-poll:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install feedparser requests pytz beautifulsoup4 lxml
+
+      - name: Run poll script
+        env:
+          # TELEGRAM: required (token + chat id)
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          # Optional: Slack webhook or SMTP for email alerts
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+
+          # Tuning
+          TIMEZONE: Europe/Paris
+          DAILY_DIGEST_HOUR: '8'
+          MAX_TICKERS: '200'   # how many S&P500 tickers to process (default 200). Increase if you want more.
+        run: |
+          python main_sp500_action.py
