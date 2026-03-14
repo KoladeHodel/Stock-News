@@ -12,7 +12,15 @@ on:
       mode:
         description: 'Run mode for manual trigger: auto | morning | evening'
         required: false
-        default: 'auto'
+        default: 'morning'
+      process_all:
+        description: 'Manual run only: process all batches? true | false'
+        required: false
+        default: 'false'
+      max_tickers:
+        description: 'Manual run only: batch size'
+        required: false
+        default: '200'
 
 jobs:
   run-poll:
@@ -39,11 +47,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install feedparser requests pytz beautifulsoup4 lxml
 
-      - name: Run digest poller (manual mode support)
+      - name: Run digest poller
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -52,13 +59,12 @@ jobs:
           TIMEZONE: Europe/Paris
           DAILY_DIGEST_HOUR_MORNING: '5'
           DAILY_DIGEST_HOUR_EVENING: '18'
-          MAX_TICKERS: '200'
-          PROCESS_ALL_BATCHES: 'false'
+          MAX_TICKERS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.max_tickers || '200' }}
+          PROCESS_ALL_BATCHES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.process_all || 'true' }}
           THROTTLE_SECONDS: '0.4'
           RECENT_DAYS: '2'
           UPCOMING_DAYS: '5'
-          # pass manual mode input to script (will be empty for scheduled runs)
-          MANUAL_MODE: ${{ github.event.inputs.mode }}
+          MANUAL_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode || '' }}
         run: |
           mkdir -p .cache
           python main_improved_action.py
