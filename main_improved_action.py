@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """
-main_improved_action.py
-Improved GitHub Actions one-shot poller:
+main_improved_action.py (updated)
+
+Improved GitHub Actions one-shot poller (full file):
  - Auto S&P500 + NASDAQ-100 (Wikipedia)
  - Rotation by GITHUB_RUN_NUMBER / time to process the universe in chunks
  - Focused Google News RSS queries per ticker/company + event keywords
  - Classifies only your 6 event types and alerts via Telegram (required) + optional Slack/Email
  - No persistence (dedupe only in-run)
+ - Filters out items older than RECENT_DAYS (default 7)
  - Daily digest at configured local hour (Europe/Paris by default)
 
-Config (env):
+Environment variables:
  - TELEGRAM_BOT_TOKEN (required)
  - TELEGRAM_CHAT_ID  (required)
  - SLACK_WEBHOOK (optional)
  - SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_EMAIL_TO (optional)
- - MAX_TICKERS (how many tickers to process this run, default 250)
+ - MAX_TICKERS (default 250) -- how many tickers processed this run
  - TIMEZONE (default Europe/Paris)
  - DAILY_DIGEST_HOUR (default 8)
- - THROTTLE_SECONDS (delay between feed polls, default 0.4)
- - USER_AGENT (optional override for HTTP)
- - GITHUB_RUN_NUMBER (GitHub Actions provides this automatically; used for rotation)
+ - THROTTLE_SECONDS (default 0.4)
+ - RECENT_DAYS (default 7) -- ignore news older than this many days
+ - USER_AGENT (optional HTTP user agent override)
+ - GITHUB_RUN_NUMBER (provided by Actions; used for rotation)
 """
 
 import os
@@ -29,13 +32,13 @@ import urllib.parse
 import feedparser
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from email.message import EmailMessage
 import smtplib
 import re
 
-# --------------- Configuration ---------------
+# ---------------- Config ----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK")
@@ -50,6 +53,7 @@ TIMEZONE = os.getenv("TIMEZONE", "Europe/Paris")
 DAILY_DIGEST_HOUR = int(os.getenv("DAILY_DIGEST_HOUR", "8"))
 THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "0.4"))
 USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (compatible; MarketAlerts/1.0)")
+RECENT_DAYS = int(os.getenv("RECENT_DAYS", "7"))  # only accept items within this many days
 
 # keywords used to build Google News query - grouped to match your 6 types
 KEYWORDS = [
@@ -64,7 +68,7 @@ KEYWORDS = [
 # targeted event labels (only these generate alerts)
 TARGET_LABELS = {"earnings", "takeover", "scandal", "product_launch", "venture_result", "major_deal"}
 
-# --------------- Utilities ---------------
+# ---------------- Utilities ----------------
 def fingerprint(title, link, published):
     return hashlib.sha256(f"{title}|{link}|{published}".encode()).hexdigest()
 
@@ -87,7 +91,7 @@ def post_json(url, json_payload, timeout=10):
         print(f"POST error to {url}: {e}")
         return False
 
-# --------------- Notify channels ---------------
+# ---------------- Notify channels ----------------
 def notify_telegram(text):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         print("[Telegram missing] would send:", text)
@@ -121,22 +125,19 @@ def send_email(subject, body_html):
     except Exception as e:
         print("Email send error:", e)
 
-# --------------- Fetch indices ---------------
-def fetch_wikipedia_table(url, table_id_hint=None):
+# ---------------- Fetch indices ----------------
+def fetch_wikipedia_table(url):
     html = safe_get(url)
     if not html:
         return []
     soup = BeautifulSoup(html, "lxml")
     tables = soup.find_all("table", class_="wikitable")
-    if not tables:
-        return []
     rows = []
     for t in tables:
         for tr in t.find_all("tr")[1:]:
             cols = tr.find_all(["td", "th"])
-            if len(cols) < 2:
-                continue
-            rows.append(cols)
+            if len(cols) >= 2:
+                rows.append(cols)
     return rows
 
 def get_sp500_list():
@@ -145,7 +146,6 @@ def get_sp500_list():
         rows = fetch_wikipedia_table(url)
         out = []
         for cols in rows:
-            # symbol usually in first column, name usually second
             ticker = cols[0].get_text(strip=True)
             name = cols[1].get_text(strip=True)
             out.append((ticker.replace(".", "-"), name))
@@ -162,16 +162,13 @@ def get_nasdaq100_list():
         if not html:
             return []
         soup = BeautifulSoup(html, "lxml")
-        # Table with constituents often has header 'Ticker' or column arrangement; we'll look for tables with tickers
         out = []
         for table in soup.find_all("table", class_="wikitable"):
             for tr in table.find_all("tr")[1:]:
                 tds = tr.find_all(["td", "th"])
                 if len(tds) >= 2:
-                    # some tables list company then ticker, others reverse; try both
                     a = tds[0].get_text(strip=True)
                     b = tds[1].get_text(strip=True)
-                    # heuristics: if second cell is all-uppercase ticker-like
                     if re.fullmatch(r"[A-Z0-9\.\-]{1,10}", b):
                         name = a
                         ticker = b
@@ -179,7 +176,6 @@ def get_nasdaq100_list():
                         name = b
                         ticker = a
                     else:
-                        # fallback - skip ambiguous rows
                         continue
                     out.append((ticker.replace(".", "-"), name))
         print(f"NASDAQ-100 count fetched: {len(out)}")
@@ -188,64 +184,107 @@ def get_nasdaq100_list():
         print("get_nasdaq100_list error:", e)
         return []
 
-# --------------- Build Google News RSS query ---------------
+# ---------------- Build Google News RSS ----------------
 def build_google_news_rss(ticker, name):
-    # Query: (TICKER OR "Company Name") (keyword1 OR keyword2 ...)
-    # We URL-encode the full query and prefer US news (hl=en-US&gl=US&ceid=US:en)
     company_phrase = f'"{name}"'
     keywords_or = " OR ".join(KEYWORDS)
     query = f"({ticker} OR {company_phrase}) ({keywords_or})"
     encoded = urllib.parse.quote(query)
     return f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
 
-# --------------- Classifier (strict patterns) ---------------
+# ---------------- Date parsing & recency filter ----------------
+def parse_entry_published(entry, target_tz):
+    """
+    Return a timezone-aware datetime for the feed entry published time.
+    Uses published_parsed if available, otherwise tries ISO-like parsing.
+    If parsing fails, return None.
+    """
+    # entry may be a feedparser entry (mapping-like)
+    try:
+        if entry.get("published_parsed"):
+            ts = time.mktime(entry["published_parsed"])
+            dt = datetime.fromtimestamp(ts, pytz.UTC).astimezone(target_tz)
+            return dt
+    except Exception:
+        pass
+
+    pub = entry.get("published") or entry.get("updated") or ""
+    if pub:
+        s = pub.strip()
+        try:
+            # normalize trailing Z
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=pytz.UTC)
+            return dt.astimezone(target_tz)
+        except Exception:
+            # try parsing common formats loosely
+            try:
+                # feedparser sometimes gives RFC822-like strings; attempt to parse via feedparser
+                parsed = feedparser.parse("http://example.com/?" + urllib.parse.quote_plus(s))
+                if parsed and parsed.entries:
+                    # hacky fallback - not reliable
+                    pass
+            except Exception:
+                pass
+            # last resort: extract a 4-digit year and return Jan 1 of that year (conservative -> will likely be too old)
+            m = re.search(r"(20\d{2})", s)
+            if m:
+                try:
+                    year = int(m.group(1))
+                    return datetime(year, 1, 1, tzinfo=target_tz)
+                except Exception:
+                    pass
+    return None
+
+def is_recent_entry(entry, target_tz, days=RECENT_DAYS):
+    dt = parse_entry_published(entry, target_tz)
+    if not dt:
+        # if we can't parse, be conservative and skip it
+        return False
+    now = datetime.now(target_tz)
+    return (now - dt) <= timedelta(days=days)
+
+# ---------------- Classifier ----------------
 def classify(title, summary):
     txt = (title + " " + (summary or "")).lower()
 
-    # Earnings: explicit keywords near quarter/year or EPS terms
-    if re.search(r"\b(earnings|quarterly results|q[1-4]\s?\s?results|eps|earnings per share|announces results|reports results|reports q)", txt):
+    if re.search(r"\b(earnings|quarterly results|q[1-4]\s?\s?results|eps|earnings per share|announces results|reports results|reports q)\b", txt):
         return "earnings"
 
-    # Takeover / M&A: "acquire", "acquisition", "merger", "will acquire", "to buy", "agreement to buy"
     if re.search(r"\b(acquir|acquisition|merger|takeover|will acquire|to buy|agrees to buy|agreed to buy|s-4|s-4 filing)\b", txt):
         return "takeover"
 
-    # Scandal: legal/regulatory language
     if re.search(r"\b(scandal|allegation|fraud|lawsuit|investigation|probe|charged|indicted|settlement|regulator)\b", txt):
         return "scandal"
 
-    # Product launch: "launch", "unveil", "introduce", "new product", "releases"
     if re.search(r"\b(launch|launches|unveil|introduce|introduces|new product|releases|announces new)\b", txt):
         return "product_launch"
 
-    # Venture result: mention of pilot/joint venture + success/failure words
     if re.search(r"\b(joint venture|spin-off|pilot|venture|funding|partnership pilot)\b", txt) and re.search(r"\b(success|succeed|failed|failure|abandon|abandons|halts)\b", txt):
         return "venture_result"
 
-    # Major deal/partnership: sign deal, strategic partnership, contract worth $X
     if re.search(r"\b(partnership|partners with|signs deal|strategic partnership|contract worth|agreement with|signed a deal)\b", txt):
         return "major_deal"
 
     return "other"
 
-# --------------- RSS poll & routing ---------------
+# ---------------- Polling & routing ----------------
 def poll_feed(url):
     items = []
     try:
         parsed = feedparser.parse(url)
+        # return raw entries so we preserve published_parsed etc.
         for e in parsed.entries:
-            title = e.get("title", "")
-            link = e.get("link", "")
-            summary = e.get("summary", "") or e.get("description", "")
-            published = e.get("published", e.get("updated", datetime.utcnow().isoformat()))
-            items.append({"title": title, "link": link, "summary": summary, "published": published})
+            items.append(e)
     except Exception as e:
         print("feedparser error for", url, e)
     return items
 
-# --------------- Main logic ---------------
 def main():
-    # basic validation
+    # Validate required secrets
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         print("ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required environment variables.")
         return
@@ -254,12 +293,12 @@ def main():
     now_local = datetime.now(tz)
     date_iso = now_local.strftime("%Y-%m-%d")
 
-    # fetch ticker lists
+    # fetch lists
     sp = get_sp500_list()
     nas = get_nasdaq100_list()
     combined = sp + nas
 
-    # dedupe by ticker key (ticker->(ticker,name))
+    # dedupe by ticker
     uniq = {}
     for t, n in combined:
         key = t.upper()
@@ -268,20 +307,19 @@ def main():
     universe = list(uniq.values())
     total = len(universe)
     if total == 0:
-        print("No tickers found. Exiting.")
+        print("No tickers found; exiting.")
         return
 
-    # rotation calculation: derive a run_index from GITHUB_RUN_NUMBER or time
+    # rotation logic
     run_num = os.getenv("GITHUB_RUN_NUMBER")
     try:
-        run_index = int(run_num) if run_num else int(time.time() // (60*30))  # half-hour epoch-based fallback
+        run_index = int(run_num) if run_num else int(time.time() // (60*30))
     except Exception:
         run_index = int(time.time() // (60*30))
-    # compute chunk start based on run_index
+
     chunk_size = max(1, min(MAX_TICKERS, total))
-    # rotate window offset every run so we cycle through full universe
     offset = (run_index * chunk_size) % total
-    # build rotated slice (wrap around)
+
     def slice_window(lst, off, size):
         if size >= len(lst):
             return lst
@@ -298,55 +336,56 @@ def main():
     for ticker, cname in selected:
         feeds.append((ticker, cname, build_google_news_rss(ticker, cname)))
 
-    # in-run dedupe
     seen = set()
     digest = []
 
-    # poll feeds sequentially with light throttling
+    # poll each feed
     for ticker, cname, rss in feeds:
-        # guard: sometimes Google News blocks suspicious queries — skip on fail
         items = poll_feed(rss)
         if not items:
             time.sleep(THROTTLE_SECONDS)
             continue
-        for it in items:
-            fp = fingerprint(it["title"], it["link"], it["published"])
+        for entry in items:
+            # filter by recency first
+            if not is_recent_entry(entry, tz, RECENT_DAYS):
+                continue
+            title = entry.get("title", "") or ""
+            link = entry.get("link", "") or ""
+            summary = entry.get("summary", "") or entry.get("description", "") or ""
+            published_str = entry.get("published") or entry.get("updated") or ""
+            fp = fingerprint(title, link, published_str)
             if fp in seen:
                 continue
             seen.add(fp)
-            label = classify(it["title"], it.get("summary", ""))
+            label = classify(title, summary)
             if label == "other":
                 continue
-            # only alert on target labels
             if label in TARGET_LABELS:
-                # create a compact alert message
-                alert_text = f"[{label.upper()}] {ticker} — {it['title']}\n{it.get('link')}"
-                # add a short tag for company name if exists
-                if cname:
-                    alert_text = f"[{label.upper()}] {ticker} / {cname} — {it['title']}\n{it.get('link')}"
+                alert_text = f"[{label.upper()}] {ticker} / {cname} — {title}\n{link}"
                 print("ALERT:", alert_text)
                 notify_telegram(alert_text)
                 notify_slack(alert_text)
-                # send email for highest severity (takeover/scandal/major_deal)
                 if label in {"takeover", "scandal", "major_deal"}:
                     send_email(f"[ALERT] {label.upper()} — {ticker}", f"<p>{alert_text}</p>")
-                # add to digest with score heuristic
                 score = 90 if label in {"takeover", "scandal", "major_deal"} else 60
-                digest.append({"label": label, "title": it["title"], "link": it["link"], "ticker": ticker, "score": score})
-            # small per-item throttle
+                digest.append({"label": label, "title": title, "link": link, "ticker": ticker, "score": score})
+            # small per-entry throttle
             time.sleep(0.08)
         # throttle between feeds
         time.sleep(THROTTLE_SECONDS)
 
-    # also include today's scheduled earnings (Yahoo) for broader capture
+    # include today's scheduled earnings via Yahoo (recent filter applies)
     try:
         yahoo_items = fetch_yahoo_earnings_for_date(date_iso)
         for it in yahoo_items:
+            # create a minimal fake entry to use recency parser logic
+            fake_entry = {"title": it["title"], "link": it["link"], "published": it["published"]}
+            if not is_recent_entry(fake_entry, tz, RECENT_DAYS):
+                continue
             fp = fingerprint(it["title"], it["link"], it["published"])
             if fp in seen:
                 continue
             seen.add(fp)
-            # treat these as earnings
             alert_text = f"[EARNINGS] {it['title']}\n{it['link']}"
             print("EARNINGS SCHEDULE:", alert_text)
             notify_telegram(alert_text)
@@ -371,7 +410,7 @@ def main():
     else:
         print(f"Run complete at {now_local.isoformat()}; not digest hour ({DAILY_DIGEST_HOUR}).")
 
-# helper: Yahoo earnings scraper (kept local to avoid external dependency)
+# ---------------- Yahoo earnings scraper ----------------
 def fetch_yahoo_earnings_for_date(date_iso):
     url = f"https://finance.yahoo.com/calendar/earnings?day={date_iso}"
     html = safe_get(url)
@@ -391,6 +430,6 @@ def fetch_yahoo_earnings_for_date(date_iso):
             items.append({"title": title, "link": url, "summary": f"EPS est: {eps_est}", "published": date_iso})
     return items
 
-# --------------- run ---------------
+# ---------------- Entry point ----------------
 if __name__ == "__main__":
     main()
