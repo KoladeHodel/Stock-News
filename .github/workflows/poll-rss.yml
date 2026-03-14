@@ -2,11 +2,8 @@ name: Poll US Market (S&P500 + NASDAQ100) & Digest (morning + evening delta)
 
 on:
   schedule:
-    - cron: '03 03 * * *'
-    - cron: '00 03 * * *'
-    - cron: '00 04 * * *'
-    - cron: '00 16 * * *'
-    - cron: '00 17 * * *'
+    - cron: '0 4 * * *'
+    - cron: '0 18 * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -33,9 +30,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .cache
-          key: market-seen-v1-${{ runner.os }}
+          key: market-seen-v2-${{ runner.os }}
           restore-keys: |
-            market-seen-v1-
+            market-seen-v2-
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -73,4 +70,4 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .cache
-          key: market-seen-v1-${{ runner.os }}
+          key: market-seen-v2-${{ runner.os }}
