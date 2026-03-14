@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-main_improved_action.py (drop-in final)
+main_improved_action.py (final — telegram splitter + robust email attachment)
 
 Features:
  - Morning full digest @ 05:00 Europe/Paris (configurable via DAILY_DIGEST_HOUR_MORNING)
@@ -8,9 +8,9 @@ Features:
  - Manual trigger support: workflow_dispatch with input 'mode' -> MANUAL_MODE env
  - Robust upcoming earnings fetch (Yahoo JSON -> fallback HTML)
  - Upcoming earnings shown in morning only, NOT marked as seen (so they reappear each morning)
- - RECENT_DAYS controls news recency (default 7); UPCOMING_DAYS controls upcoming earnings window (default 7)
+ - RECENT_DAYS controls news recency; UPCOMING_DAYS controls upcoming earnings window
  - Persistent cache: .cache/seen.json and .cache/morning_snapshot.json (actions/cache used in workflow)
- - One Telegram message per digest; optional SMTP email
+ - One Telegram message per digest (split into chunks if long); full email with attachment
  - Improved AI intentional-investment detection via regex patterns
 """
 
@@ -216,11 +216,8 @@ def fetch_yahoo_earnings_for_date_json(date_iso):
         r.raise_for_status()
         data = r.json()
         results = []
-        # Attempt common JSON layouts
-        # Option A: data['calendar']['result'] -> list of dicts with 'earnings'
         calendar = data.get("calendar") or {}
         if isinstance(calendar, dict) and "result" in calendar:
-            # result may be list; inside may be 'earnings'
             res = calendar.get("result")
             if isinstance(res, list):
                 for item in res:
@@ -232,7 +229,6 @@ def fetch_yahoo_earnings_for_date_json(date_iso):
                             time_of_day = e.get("time", "") or e.get("timeOfDay","")
                             title = f"Earnings scheduled: {sym} ({name}) {time_of_day}".strip()
                             results.append({"title": title, "link": url, "published": date_iso, "ticker": sym, "company": name})
-        # Option B: data['earnings']['result'] etc.
         if not results:
             earnings = data.get("earnings") or {}
             res = earnings.get("result") or earnings.get("calendar") or None
@@ -243,15 +239,12 @@ def fetch_yahoo_earnings_for_date_json(date_iso):
                     time_of_day = e.get("time", "") or e.get("timeOfDay","")
                     title = f"Earnings scheduled: {sym} ({name}) {time_of_day}".strip()
                     results.append({"title": title, "link": url, "published": date_iso, "ticker": sym, "company": name})
-        # Option C: top-level result lists
         if not results:
-            # attempt to find lists in the JSON
             def walk_find(obj):
                 found = []
                 if isinstance(obj, dict):
                     for k,v in obj.items():
                         if isinstance(v, list):
-                            # check if entries look like earnings (contain 'symbol'/'time')
                             for item in v:
                                 if isinstance(item, dict) and ("symbol" in item or "time" in item or "shortName" in item):
                                     sym = item.get("symbol") or item.get("ticker") or ""
@@ -263,7 +256,6 @@ def fetch_yahoo_earnings_for_date_json(date_iso):
                             found.extend(walk_find(v))
                 return found
             results = walk_find(data)
-        # return deduped results
         seen_local = set(); uniq = []
         for it in results:
             key = (it.get("title",""), it.get("link",""))
@@ -307,7 +299,6 @@ def fetch_upcoming_earnings(days=UPCOMING_DAYS):
         if items:
             out.extend(items)
         time.sleep(0.15)
-    # dedupe
     seen_local = set(); uniq = []
     for it in out:
         key = (it.get("title",""), it.get("link",""))
@@ -352,31 +343,80 @@ def is_scandal_after_launch(title, summary):
     ]
     return any(re.search(p, txt) for p in patterns)
 
-# ---------------- Notify digest helpers ----------------
+# ---------------- Notify digest helpers (telegram splitter + full email attachment) ----------------
 def notify_telegram_digest(text):
+    """
+    Send a digest to Telegram, splitting into multiple messages if length exceeds
+    Telegram limits (~4096). We conservatively split at 3800 chars.
+    """
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         print("[Telegram missing] would send digest length:", len(text))
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=10)
-    except Exception as e:
-        print("Telegram send error:", e)
 
-def send_email(subject, body_html):
+    CHUNK_SIZE = 3800
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    if len(text) <= CHUNK_SIZE:
+        try:
+            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=10)
+        except Exception as e:
+            print("Telegram send error:", e)
+        return
+
+    parts = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= CHUNK_SIZE:
+            parts.append(remaining)
+            break
+        slice_ = remaining[:CHUNK_SIZE]
+        idx = slice_.rfind("\n\n")
+        if idx == -1:
+            idx = slice_.rfind("\n")
+        if idx == -1:
+            idx = CHUNK_SIZE
+        parts.append(remaining[:idx].rstrip())
+        remaining = remaining[idx:].lstrip()
+
+    for p in parts:
+        try:
+            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": p, "disable_web_page_preview": True}, timeout=10)
+            time.sleep(0.35)
+        except Exception as e:
+            print("Telegram send error (chunk):", e)
+
+def send_email(subject, full_text):
+    """
+    Send a full HTML email and attach the full_text as a .txt file.
+    - subject: email subject string
+    - full_text: plain text full digest
+    """
     if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO):
         print("Email not sent (SMTP not configured).")
         return
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = SMTP_USER
-    msg["To"] = ALERT_EMAIL_TO
-    msg.set_content(body_html, subtype="html")
+
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = SMTP_USER
+        msg["To"] = ALERT_EMAIL_TO
+
+        html_body = "<html><body><pre style='font-family:monospace;white-space:pre-wrap;'>" + \
+                    (full_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")) + \
+                    "</pre></body></html>"
+        msg.set_content(full_text)
+        msg.add_alternative(html_body, subtype="html")
+
+        attachment_filename = "full_digest.txt"
+        msg.add_attachment(full_text.encode("utf-8"), maintype="text", subtype="plain", filename=attachment_filename)
+
+        print(f"Email payload prepared: subject='{subject}', body_length={len(full_text)}, attachment='{attachment_filename}'")
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
             s.starttls()
             s.login(SMTP_USER, SMTP_PASS)
             s.send_message(msg)
+        print("Email sent successfully.")
     except Exception as e:
         print("Email send error:", e)
 
@@ -555,11 +595,11 @@ def main():
                     parts.append(f"• {it['ticker']} — {it['title']}\n")
                 parts.append("\n")
             message = "".join(parts)
-            if len(message) > 3800:
-                message = message[:3800] + "\n\n(Truncated — full digest emailed if configured.)"
+            # send via Telegram (split if needed)
             notify_telegram_digest(message)
+            # send full email with attachment if configured
             if SMTP_HOST and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO:
-                send_email("Morning Focused Market Digest", "<pre>" + message + "</pre>")
+                send_email("Morning Focused Market Digest", message)
         # Save morning snapshot (full seen set after morning)
         save_json_set(MORNING_SNAPSHOT_FILE, seen)
         print("Morning snapshot saved.")
@@ -615,11 +655,9 @@ def main():
                     parts.append(f"• {it['ticker']} — {it['title']}\n")
                 parts.append("\n")
             message = "".join(parts)
-            if len(message) > 3800:
-                message = message[:3800] + "\n\n(Truncated — full digest emailed if configured.)"
             notify_telegram_digest(message)
             if SMTP_HOST and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO:
-                send_email("Evening Delta Market Digest", "<pre>" + message + "</pre>")
+                send_email("Evening Delta Market Digest", message)
         # update morning snapshot after evening run so next evening compares to new morning
         save_json_set(MORNING_SNAPSHOT_FILE, seen)
         print("Morning snapshot updated after evening run.")
