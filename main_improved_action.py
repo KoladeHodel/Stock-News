@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-main_improved_action.py (final updated)
+main_improved_action.py (drop-in final)
 
 Features:
- - Twice-daily digests: morning full digest (05:00 Europe/Paris) and evening delta (18:00 Europe/Paris)
- - Manual trigger via workflow_dispatch with MANUAL_MODE: auto|morning|evening
- - Upcoming earnings shown each morning (not persisted to 'seen')
- - Concise Telegram summary (per-category cap) + full HTML email digest
- - Rotation over S&P500 + NASDAQ-100
- - Persistent seen fingerprints in .cache/seen.json (restored by actions/cache)
- - Morning snapshot in .cache/morning_snapshot.json (used to compute evening delta)
- - Improved AI intentional-investment detection
+ - Morning full digest @ 05:00 Europe/Paris (configurable via DAILY_DIGEST_HOUR_MORNING)
+ - Evening delta digest @ 18:00 Europe/Paris (configurable via DAILY_DIGEST_HOUR_EVENING)
+ - Manual trigger support: workflow_dispatch with input 'mode' -> MANUAL_MODE env
+ - Robust upcoming earnings fetch (Yahoo JSON -> fallback HTML)
+ - Upcoming earnings shown in morning only, NOT marked as seen (so they reappear each morning)
+ - RECENT_DAYS controls news recency (default 7); UPCOMING_DAYS controls upcoming earnings window (default 7)
+ - Persistent cache: .cache/seen.json and .cache/morning_snapshot.json (actions/cache used in workflow)
+ - One Telegram message per digest; optional SMTP email
+ - Improved AI intentional-investment detection via regex patterns
 """
 
 import os
@@ -27,7 +28,7 @@ import json
 from email.message import EmailMessage
 import smtplib
 
-# ---------------- Config ----------------
+# ---------------- Config (env) ----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK")
@@ -43,14 +44,14 @@ DAILY_DIGEST_HOUR_MORNING = int(os.getenv("DAILY_DIGEST_HOUR_MORNING", "5"))
 DAILY_DIGEST_HOUR_EVENING = int(os.getenv("DAILY_DIGEST_HOUR_EVENING", "18"))
 THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "0.4"))
 USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (compatible; MarketAlerts/1.0)")
-RECENT_DAYS = int(os.getenv("RECENT_DAYS", "2"))    # changed by your workflow env (default 2 here)
-UPCOMING_DAYS = int(os.getenv("UPCOMING_DAYS", "5"))# changed by your workflow env (default 5 here)
+RECENT_DAYS = int(os.getenv("RECENT_DAYS", "7"))
+UPCOMING_DAYS = int(os.getenv("UPCOMING_DAYS", "7"))
 
 CACHE_DIR = ".cache"
 SEEN_FILE = os.path.join(CACHE_DIR, "seen.json")
 MORNING_SNAPSHOT_FILE = os.path.join(CACHE_DIR, "morning_snapshot.json")
 
-# Keyword groups and patterns
+# ---------------- Keyword groups / patterns ----------------
 AI_INTENT_KEYPHRASES = [
     r"\binvest(s|ed|ing)?\b.*\b(ai|artificial intelligence|generative ai|ml|machine learning)\b",
     r"\bcommit(s|ted)?\b.*\b(ai|artificial intelligence)\b",
@@ -69,7 +70,7 @@ DEAL_KEYWORDS = ["partnership","partners with","signs deal","strategic partnersh
 MNA_KEYWORDS = ["acquir","acquisition","merger","takeover","s-4","will acquire","to buy","agrees to buy"]
 EARNINGS_KEYWORDS = ["earnings","quarterly results","eps","revenue","beats","misses"]
 
-# ---------------- Utility helpers ----------------
+# ---------------- Helpers ----------------
 def ensure_cache_dir():
     try:
         if not os.path.exists(CACHE_DIR):
@@ -78,7 +79,7 @@ def ensure_cache_dir():
         print("Warning: could not create cache dir:", e)
 
 def fingerprint(title, link, published):
-    return hashlib.sha256(f"{(title or '')}|{(link or '')}|{(published or '')}".encode()).hexdigest()
+    return hashlib.sha256(f"{title}|{link}|{published}".encode()).hexdigest()
 
 def safe_get(url, timeout=15):
     headers = {"User-Agent": USER_AGENT}
@@ -189,7 +190,7 @@ def get_nasdaq100_list():
     print(f"Fetched NASDAQ-100: {len(out)}")
     return out
 
-# ---------------- Build feed query & polling ----------------
+# ---------------- Build feed query & poll ----------------
 def build_google_news_rss(ticker, name):
     company_phrase = f'"{name}"'
     q_terms = ["earnings","launch","product","partnership","invest","ai","gpu","acquire","merger","lawsuit","investigation"]
@@ -205,6 +206,114 @@ def poll_feed(url):
     except Exception as e:
         print("feedparser error for", url, e)
         return []
+
+# ---------------- Yahoo earnings (robust JSON + HTML fallback) ----------------
+def fetch_yahoo_earnings_for_date_json(date_iso):
+    url = f"https://query1.finance.yahoo.com/v7/finance/calendar/earnings?day={date_iso}"
+    try:
+        headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        results = []
+        # Attempt common JSON layouts
+        # Option A: data['calendar']['result'] -> list of dicts with 'earnings'
+        calendar = data.get("calendar") or {}
+        if isinstance(calendar, dict) and "result" in calendar:
+            # result may be list; inside may be 'earnings'
+            res = calendar.get("result")
+            if isinstance(res, list):
+                for item in res:
+                    maybe = item.get("earnings") or item.get("earningsDate") or []
+                    if isinstance(maybe, list):
+                        for e in maybe:
+                            sym = e.get("symbol") or e.get("ticker") or e.get("shortName") or ""
+                            name = e.get("shortName") or e.get("company") or ""
+                            time_of_day = e.get("time", "") or e.get("timeOfDay","")
+                            title = f"Earnings scheduled: {sym} ({name}) {time_of_day}".strip()
+                            results.append({"title": title, "link": url, "published": date_iso, "ticker": sym, "company": name})
+        # Option B: data['earnings']['result'] etc.
+        if not results:
+            earnings = data.get("earnings") or {}
+            res = earnings.get("result") or earnings.get("calendar") or None
+            if isinstance(res, list):
+                for e in res:
+                    sym = e.get("symbol") or e.get("ticker") or ""
+                    name = e.get("shortName") or e.get("company") or ""
+                    time_of_day = e.get("time", "") or e.get("timeOfDay","")
+                    title = f"Earnings scheduled: {sym} ({name}) {time_of_day}".strip()
+                    results.append({"title": title, "link": url, "published": date_iso, "ticker": sym, "company": name})
+        # Option C: top-level result lists
+        if not results:
+            # attempt to find lists in the JSON
+            def walk_find(obj):
+                found = []
+                if isinstance(obj, dict):
+                    for k,v in obj.items():
+                        if isinstance(v, list):
+                            # check if entries look like earnings (contain 'symbol'/'time')
+                            for item in v:
+                                if isinstance(item, dict) and ("symbol" in item or "time" in item or "shortName" in item):
+                                    sym = item.get("symbol") or item.get("ticker") or ""
+                                    name = item.get("shortName") or item.get("company") or ""
+                                    time_of_day = item.get("time", "") or item.get("timeOfDay","")
+                                    title = f"Earnings scheduled: {sym} ({name}) {time_of_day}".strip()
+                                    found.append({"title": title, "link": url, "published": date_iso, "ticker": sym, "company": name})
+                        elif isinstance(v, dict):
+                            found.extend(walk_find(v))
+                return found
+            results = walk_find(data)
+        # return deduped results
+        seen_local = set(); uniq = []
+        for it in results:
+            key = (it.get("title",""), it.get("link",""))
+            if key not in seen_local:
+                seen_local.add(key); uniq.append(it)
+        return uniq
+    except Exception as e:
+        print("Yahoo JSON earnings fetch failed:", e)
+        return []
+
+def fetch_yahoo_earnings_for_date_html(date_iso):
+    url = f"https://finance.yahoo.com/calendar/earnings?day={date_iso}"
+    html = safe_get(url)
+    items = []
+    if not html:
+        return items
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        rows = soup.select("table tbody tr")
+        for tr in rows:
+            tds = tr.find_all("td")
+            if len(tds) >= 6:
+                ticker = tds[0].get_text(strip=True)
+                name = tds[1].get_text(strip=True)
+                eps_est = tds[2].get_text(strip=True)
+                time_of_day = tds[4].get_text(strip=True)
+                title = f"Earnings scheduled: {ticker} ({name}) {time_of_day}"
+                items.append({"title": title, "link": url, "published": date_iso, "ticker": ticker, "company": name})
+    except Exception as e:
+        print("Yahoo HTML parse failed:", e)
+    return items
+
+def fetch_upcoming_earnings(days=UPCOMING_DAYS):
+    tz = pytz.timezone(TIMEZONE)
+    out = []
+    for d in range(days):
+        day = (datetime.now(tz) + timedelta(days=d)).strftime("%Y-%m-%d")
+        items = fetch_yahoo_earnings_for_date_json(day)
+        if not items:
+            items = fetch_yahoo_earnings_for_date_html(day)
+        if items:
+            out.extend(items)
+        time.sleep(0.15)
+    # dedupe
+    seen_local = set(); uniq = []
+    for it in out:
+        key = (it.get("title",""), it.get("link",""))
+        if key not in seen_local:
+            seen_local.add(key); uniq.append(it)
+    return uniq
 
 # ---------------- AI detection & classification ----------------
 def detect_ai_intent(title, summary):
@@ -243,48 +352,10 @@ def is_scandal_after_launch(title, summary):
     ]
     return any(re.search(p, txt) for p in patterns)
 
-# ---------------- Yahoo earnings (upcoming window) ----------------
-def fetch_yahoo_earnings_for_date(date_iso):
-    url = f"https://finance.yahoo.com/calendar/earnings?day={date_iso}"
-    html = safe_get(url)
-    items = []
-    if not html:
-        return items
-    soup = BeautifulSoup(html, "lxml")
-    rows = soup.select("table tbody tr")
-    for tr in rows:
-        tds = tr.find_all("td")
-        if len(tds) >= 6:
-            ticker = tds[0].get_text(strip=True)
-            name = tds[1].get_text(strip=True)
-            eps_est = tds[2].get_text(strip=True)
-            time_of_day = tds[4].get_text(strip=True)
-            title = f"Earnings scheduled: {ticker} ({name}) {time_of_day}"
-            items.append({"title": title, "link": url, "published": date_iso, "ticker": ticker, "company": name})
-    return items
-
-def fetch_upcoming_earnings(days=UPCOMING_DAYS):
-    tz = pytz.timezone(TIMEZONE)
-    out = []
-    for d in range(days):
-        day = (datetime.now(tz) + timedelta(days=d)).strftime("%Y-%m-%d")
-        try:
-            out += fetch_yahoo_earnings_for_date(day)
-            time.sleep(0.15)
-        except Exception:
-            pass
-    seen_local = set()
-    uniq = []
-    for it in out:
-        key = (it["title"], it["link"])
-        if key not in seen_local:
-            seen_local.add(key); uniq.append(it)
-    return uniq
-
-# ---------------- Notify digest ----------------
+# ---------------- Notify digest helpers ----------------
 def notify_telegram_digest(text):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        print("[Telegram missing] (would send) length:", len(text))
+        print("[Telegram missing] would send digest length:", len(text))
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
@@ -294,7 +365,7 @@ def notify_telegram_digest(text):
 
 def send_email(subject, body_html):
     if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO):
-        print("Email not configured; skipping email send.")
+        print("Email not sent (SMTP not configured).")
         return
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -327,33 +398,31 @@ def main():
     if manual_run:
         mm = (manual_mode_env or "").strip().lower()
         if mm == "evening":
-            is_morning = False
-            is_evening = True
+            is_morning = False; is_evening = True
             print("Manual run requested: EVENING (delta) mode.")
         else:
-            is_morning = True
-            is_evening = False
+            is_morning = True; is_evening = False
             print("Manual run requested: MORNING (full) mode.")
     else:
         is_morning = (local_hour == DAILY_DIGEST_HOUR_MORNING)
         is_evening = (local_hour == DAILY_DIGEST_HOUR_EVENING)
         print(f"Local hour {local_hour}. is_morning={is_morning} is_evening={is_evening}")
 
-    # prepare caches
     ensure_cache_dir()
     seen = load_json_set(SEEN_FILE)
     morning_snapshot = load_json_set(MORNING_SNAPSHOT_FILE)
 
-    # upcoming earnings (always fetched; NOT added to 'seen' so they reappear each morning)
+    # Fetch upcoming earnings (robust). Debug print for logs.
     upcoming = fetch_upcoming_earnings(UPCOMING_DAYS)
+    print(f"DEBUG: upcoming earnings fetched: {len(upcoming)} items. Sample: {upcoming[:3]}")
 
     # If not digest hour and not manual, exit early (cheap)
     if not (is_morning or is_evening):
-        print(f"Not a digest hour and not a manual run — exiting (local_hour={local_hour}).")
+        print(f"Not a digest hour and not manual. Exiting. local_hour={local_hour}")
         save_json_set(SEEN_FILE, seen)
         return
 
-    # Rotation & universe
+    # Build universe (S&P500 + NASDAQ-100) and rotation
     sp = get_sp500_list()
     nas = get_nasdaq100_list()
     combined = sp + nas
@@ -376,7 +445,8 @@ def main():
     def slice_window(lst, off, size):
         if size >= len(lst): return lst
         end = off + size
-        if end <= len(lst): return lst[off:end]
+        if end <= len(lst):
+            return lst[off:end]
         return lst[off:len(lst)] + lst[0:end - len(lst)]
 
     selected = slice_window(universe, offset, chunk_size)
@@ -384,6 +454,7 @@ def main():
 
     feeds = [(t, n, build_google_news_rss(t, n)) for (t, n) in selected]
 
+    # categories
     categories = {
         "upcoming_earnings": [],
         "ai_special": [],
@@ -395,23 +466,18 @@ def main():
 
     added_this_run = set()
 
-    # include upcoming earnings first — DO NOT mark as seen or added_this_run
-    # only include in the morning digest (so evening delta won't repeat them)
+    # include upcoming earnings in morning only; DO NOT mark them as 'seen' or add to added_this_run
     if is_morning:
         for it in upcoming:
-            title = it["title"]
-            link = it["link"]
-            published = it["published"]
-            # include ticker/company if present (Yahoo scraper may provide them)
             categories["upcoming_earnings"].append({
-                "title": title,
-                "link": link,
-                "published": published,
+                "title": it.get("title",""),
+                "link": it.get("link",""),
+                "published": it.get("published",""),
                 "ticker": it.get("ticker"),
                 "company": it.get("company")
             })
 
-    # Poll feeds & collect items (feed items ARE marked seen to avoid repeats)
+    # poll feeds and collect items (respect RECENT_DAYS)
     for ticker, cname, rss in feeds:
         entries = poll_feed(rss)
         if not entries:
@@ -449,210 +515,116 @@ def main():
                 continue
         time.sleep(THROTTLE_SECONDS)
 
-    # Debug counts to help tuning
-    print("Category counts:", {k: len(v) for k, v in categories.items()})
-    print("Added this run (fingerprints):", len(added_this_run))
-
-    # Build and send messages depending on morning/evening
+    # Build & send digests
     if is_morning:
         total_new = sum(len(v) for v in categories.values())
         if total_new == 0:
             print("Morning: no new items to send.")
         else:
-            # Build full HTML email (complete digest)
-            email_parts = []
-            header_html = f"<h2>Morning Focused Digest — {now_local.strftime('%Y-%m-%d %H:%M %Z')}</h2>"
-            header_html += f"<p>Processed {len(selected)} tickers. New items: {total_new}</p>"
-            email_parts.append(header_html)
-
+            header = f"📊 Morning Focused Digest — {now_local.strftime('%Y-%m-%d %H:%M %Z')}\nProcessed {len(selected)} tickers.\nNew items: {total_new}\n\n"
+            parts = [header]
             if categories["upcoming_earnings"]:
-                email_parts.append(f"<h3>💰 Upcoming earnings (next {UPCOMING_DAYS} days)</h3><ul>")
-                for it in categories["upcoming_earnings"]:
-                    ticker = it.get("ticker","")
-                    company = it.get("company","")
-                    email_parts.append(f"<li>{it['title']} - {ticker} / {company}</li>")
-                email_parts.append("</ul>")
-
+                parts.append(f"💰 Upcoming earnings (next {UPCOMING_DAYS} days)\n")
+                for it in categories["upcoming_earnings"][:80]:
+                    ticker_str = (it.get("ticker") or "").strip()
+                    parts.append(f"• {ticker_str} {it['title']}\n" if ticker_str else f"• {it['title']}\n")
+                parts.append("\n")
             if categories["ai_special"]:
-                email_parts.append("<h3>🧠 AI Intentional Investments / Partnerships</h3><ul>")
-                for it in categories["ai_special"]:
-                    email_parts.append(f"<li>{it['ticker']} — {it['title']}</li>")
-                email_parts.append("</ul>")
-
+                parts.append("🧠 AI Intentional Investments / Partnerships\n")
+                for it in categories["ai_special"][:40]:
+                    parts.append(f"• {it['ticker']} — {it['title']}\n")
+                parts.append("\n")
             if categories["product_launch"]:
-                email_parts.append("<h3>🚀 Product Launches</h3><ul>")
-                for it in categories["product_launch"]:
-                    email_parts.append(f"<li>{it['ticker']} — {it['title']}</li>")
-                email_parts.append("</ul>")
-
+                parts.append("🚀 Product Launches\n")
+                for it in categories["product_launch"][:40]:
+                    parts.append(f"• {it['ticker']} — {it['title']}\n")
+                parts.append("\n")
             if categories["scandal_after_launch"]:
-                email_parts.append("<h3>⚠️ Scandals linked to product launches/events</h3><ul>")
-                for it in categories["scandal_after_launch"]:
-                    email_parts.append(f"<li>{it['ticker']} — {it['title']}</li>")
-                email_parts.append("</ul>")
-
+                parts.append("⚠️ Scandals linked to product launches/events\n")
+                for it in categories["scandal_after_launch"][:40]:
+                    parts.append(f"• {it['ticker']} — {it['title']}\n")
+                parts.append("\n")
             if categories["major_deal"]:
-                email_parts.append("<h3>🤝 Major Deals / Partnerships</h3><ul>")
-                for it in categories["major_deal"]:
-                    email_parts.append(f"<li>{it['ticker']} — {it['title']}</li>")
-                email_parts.append("</ul>")
-
+                parts.append("🤝 Major Deals / Partnerships\n")
+                for it in categories["major_deal"][:40]:
+                    parts.append(f"• {it['ticker']} — {it['title']}\n")
+                parts.append("\n")
             if categories["takeover"]:
-                email_parts.append("<h3>🏢 M&A / Takeovers</h3><ul>")
-                for it in categories["takeover"]:
-                    email_parts.append(f"<li>{it['ticker']} — {it['title']}</li>")
-                email_parts.append("</ul>")
-
-            email_html = "\n".join(email_parts)
-
-            # Build concise Telegram summary (short per-category lists + counts)
-            PER_CAT_SUMMARY = 6
-            tg_lines = [f"📊 Morning Focused Digest — {now_local.strftime('%Y-%m-%d %H:%M %Z')}",
-                        f"Processed {len(selected)} tickers · New items: {total_new}\n"]
-
-            def add_summary(cat_title, items):
-                if not items:
-                    return
-                tg_lines.append(f"{cat_title} ({len(items)})")
-                for it in items[:PER_CAT_SUMMARY]:
-                    ticker = it.get("ticker","")
-                    title = it.get("title","")
-                    short = (title[:120] + "...") if len(title) > 120 else title
-                    if ticker:
-                        tg_lines.append(f"• {ticker} — {short}")
-                    else:
-                        tg_lines.append(f"• {short}")
-                if len(items) > PER_CAT_SUMMARY:
-                    tg_lines.append(f"  ...+{len(items)-PER_CAT_SUMMARY} more")
-                tg_lines.append("")
-
-            add_summary("💰 Upcoming earnings", categories["upcoming_earnings"])
-            add_summary("🧠 AI Intentions", categories["ai_special"])
-            add_summary("🚀 Product launches", categories["product_launch"])
-            add_summary("⚠️ Scandals w/ launches", categories["scandal_after_launch"])
-            add_summary("🤝 Major deals", categories["major_deal"])
-            add_summary("🏢 M&A / Takeovers", categories["takeover"])
-
-            tg_message = "\n".join(tg_lines)
-            if len(tg_message) > 3800:
-                tg_message = tg_message[:3800] + "\n\n(Truncated summary.)"
-
-            # Send concise Telegram summary + full HTML email
-            notify_telegram_digest(tg_message)
+                parts.append("🏢 M&A / Takeovers\n")
+                for it in categories["takeover"][:40]:
+                    parts.append(f"• {it['ticker']} — {it['title']}\n")
+                parts.append("\n")
+            message = "".join(parts)
+            if len(message) > 3800:
+                message = message[:3800] + "\n\n(Truncated — full digest emailed if configured.)"
+            notify_telegram_digest(message)
             if SMTP_HOST and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO:
-                send_email("Morning Focused Market Digest", email_html)
-
-        # Save morning snapshot (persist seen after morning)
+                send_email("Morning Focused Market Digest", "<pre>" + message + "</pre>")
+        # Save morning snapshot (full seen set after morning)
         save_json_set(MORNING_SNAPSHOT_FILE, seen)
         print("Morning snapshot saved.")
 
     elif is_evening:
-        # compute delta: fingerprints added_this_run that are not in morning snapshot
+        # delta = items added_this_run but not in morning_snapshot
         if not morning_snapshot:
             delta_fps = added_this_run.copy()
         else:
             delta_fps = {fp for fp in added_this_run if fp not in morning_snapshot}
-
-        # filter items by delta_fps
+        # filter categories by delta_fps
+        delta_categories = {k: [] for k in categories.keys()}
         def item_fp(it):
             return fingerprint(it.get("title",""), it.get("link",""), it.get("published","") or "")
-
-        delta_categories = {k: [] for k in categories.keys()}
         for cat, items in categories.items():
             for it in items:
                 if item_fp(it) in delta_fps:
                     delta_categories[cat].append(it)
-
         total_delta = sum(len(v) for v in delta_categories.values())
         if total_delta == 0:
             print("Evening: no new delta items since morning snapshot. No message sent.")
         else:
-            # Build full HTML email for delta
-            email_parts = []
-            header_html = f"<h2>Evening Delta Digest — {now_local.strftime('%Y-%m-%d %H:%M %Z')}</h2>"
-            header_html += f"<p>Processed {len(selected)} tickers. New since morning: {total_delta}</p>"
-            email_parts.append(header_html)
-
+            header = f"📊 Evening Delta Digest — {now_local.strftime('%Y-%m-%d %H:%M %Z')}\nProcessed {len(selected)} tickers.\nNew since morning: {total_delta}\n\n"
+            parts = [header]
             if delta_categories["upcoming_earnings"]:
-                email_parts.append(f"<h3>💰 Upcoming earnings (next {UPCOMING_DAYS} days) — New</h3><ul>")
-                for it in delta_categories["upcoming_earnings"]:
-                    email_parts.append(f"<li>{it['title']}</li>")
-                email_parts.append("</ul>")
-
+                parts.append(f"💰 Upcoming earnings (next {UPCOMING_DAYS} days)\n")
+                for it in delta_categories["upcoming_earnings"][:80]:
+                    parts.append(f"• {it['title']}\n")
+                parts.append("\n")
             if delta_categories["ai_special"]:
-                email_parts.append("<h3>🧠 AI Intentional Investments / Partnerships (new)</h3><ul>")
-                for it in delta_categories["ai_special"]:
-                    email_parts.append(f"<li>{it['ticker']} — {it['title']}</li>")
-                email_parts.append("</ul>")
-
+                parts.append("🧠 AI Intentional Investments / Partnerships (new)\n")
+                for it in delta_categories["ai_special"][:40]:
+                    parts.append(f"• {it['ticker']} — {it['title']}\n")
+                parts.append("\n")
             if delta_categories["product_launch"]:
-                email_parts.append("<h3>🚀 Product Launches (new)</h3><ul>")
-                for it in delta_categories["product_launch"]:
-                    email_parts.append(f"<li>{it['ticker']} — {it['title']}</li>")
-                email_parts.append("</ul>")
-
+                parts.append("🚀 Product Launches (new)\n")
+                for it in delta_categories["product_launch"][:40]:
+                    parts.append(f"• {it['ticker']} — {it['title']}\n")
+                parts.append("\n")
             if delta_categories["scandal_after_launch"]:
-                email_parts.append("<h3>⚠️ Scandals linked to launches/events (new)</h3><ul>")
-                for it in delta_categories["scandal_after_launch"]:
-                    email_parts.append(f"<li>{it['ticker']} — {it['title']}</li>")
-                email_parts.append("</ul>")
-
+                parts.append("⚠️ Scandals linked to launches/events (new)\n")
+                for it in delta_categories["scandal_after_launch"][:40]:
+                    parts.append(f"• {it['ticker']} — {it['title']}\n")
+                parts.append("\n")
             if delta_categories["major_deal"]:
-                email_parts.append("<h3>🤝 Major Deals / Partnerships (new)</h3><ul>")
-                for it in delta_categories["major_deal"]:
-                    email_parts.append(f"<li>{it['ticker']} — {it['title']}</li>")
-                email_parts.append("</ul>")
-
+                parts.append("🤝 Major Deals / Partnerships (new)\n")
+                for it in delta_categories["major_deal"][:40]:
+                    parts.append(f"• {it['ticker']} — {it['title']}\n")
+                parts.append("\n")
             if delta_categories["takeover"]:
-                email_parts.append("<h3>🏢 M&A / Takeovers (new)</h3><ul>")
-                for it in delta_categories["takeover"]:
-                    email_parts.append(f"<li>{it['ticker']} — {it['title']}</li>")
-                email_parts.append("</ul>")
-
-            email_html = "\n".join(email_parts)
-
-            # Build concise Telegram summary for delta
-            PER_CAT_SUMMARY = 6
-            tg_lines = [f"📊 Evening Delta Digest — {now_local.strftime('%Y-%m-%d %H:%M %Z')}",
-                        f"Processed {len(selected)} tickers · New since morning: {total_delta}\n"]
-
-            def add_summary_delta(cat_title, items):
-                if not items:
-                    return
-                tg_lines.append(f"{cat_title} ({len(items)})")
-                for it in items[:PER_CAT_SUMMARY]:
-                    ticker = it.get("ticker","")
-                    title = it.get("title","")
-                    short = (title[:120] + "...") if len(title) > 120 else title
-                    if ticker:
-                        tg_lines.append(f"• {ticker} — {short}")
-                    else:
-                        tg_lines.append(f"• {short}")
-                if len(items) > PER_CAT_SUMMARY:
-                    tg_lines.append(f"  ...+{len(items)-PER_CAT_SUMMARY} more")
-                tg_lines.append("")
-
-            add_summary_delta("💰 Upcoming earnings", delta_categories["upcoming_earnings"])
-            add_summary_delta("🧠 AI Intentions", delta_categories["ai_special"])
-            add_summary_delta("🚀 Product launches", delta_categories["product_launch"])
-            add_summary_delta("⚠️ Scandals w/ launches", delta_categories["scandal_after_launch"])
-            add_summary_delta("🤝 Major deals", delta_categories["major_deal"])
-            add_summary_delta("🏢 M&A / Takeovers", delta_categories["takeover"])
-
-            tg_message = "\n".join(tg_lines)
-            if len(tg_message) > 3800:
-                tg_message = tg_message[:3800] + "\n\n(Truncated summary.)"
-
-            # Send concise Telegram summary + full email
-            notify_telegram_digest(tg_message)
+                parts.append("🏢 M&A / Takeovers (new)\n")
+                for it in delta_categories["takeover"][:40]:
+                    parts.append(f"• {it['ticker']} — {it['title']}\n")
+                parts.append("\n")
+            message = "".join(parts)
+            if len(message) > 3800:
+                message = message[:3800] + "\n\n(Truncated — full digest emailed if configured.)"
+            notify_telegram_digest(message)
             if SMTP_HOST and SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO:
-                send_email("Evening Delta Market Digest", email_html)
-
-        # Update morning snapshot after evening run
+                send_email("Evening Delta Market Digest", "<pre>" + message + "</pre>")
+        # update morning snapshot after evening run so next evening compares to new morning
         save_json_set(MORNING_SNAPSHOT_FILE, seen)
         print("Morning snapshot updated after evening run.")
 
-    # always persist seen
+    # persist seen always
     save_json_set(SEEN_FILE, seen)
     print(f"Saved seen fingerprints: {len(seen)}")
     print("Done.")
