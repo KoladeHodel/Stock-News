@@ -2,20 +2,23 @@ name: Poll US Market (S&P500 + NASDAQ100) & Digest (morning + evening delta)
 
 on:
   schedule:
-    # To handle Europe/Paris DST transitions robustly, run at both possible UTC offsets.
-    # These runs are cheap; the script itself only sends when local time is 05:00 or 18:00.
-    - cron: '03 03 * * *'   # fallback run (rare) — kept for coverage (safe)
-    - cron: '00 03 * * *'   # 03:00 UTC
-    - cron: '00 04 * * *'   # 04:00 UTC (covers CET/CEST differences for morning)
-    - cron: '00 16 * * *'   # 16:00 UTC
-    - cron: '00 17 * * *'   # 17:00 UTC (covers CET/CEST differences for evening)
-  workflow_dispatch: {}
+    - cron: '03 03 * * *'
+    - cron: '00 03 * * *'
+    - cron: '00 04 * * *'
+    - cron: '00 16 * * *'
+    - cron: '00 17 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode for manual trigger: auto | morning | evening'
+        required: false
+        default: 'auto'
 
 jobs:
   run-poll:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Restore seen cache
@@ -26,17 +29,17 @@ jobs:
           restore-keys: |
             market-seen-v1-
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
-      - name: Install runtime dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install feedparser requests pytz beautifulsoup4 lxml
 
-      - name: Run improved digest poller (morning + evening delta)
+      - name: Run digest poller (manual mode support)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -53,6 +56,8 @@ jobs:
           THROTTLE_SECONDS: '0.4'
           RECENT_DAYS: '7'
           UPCOMING_DAYS: '7'
+          # pass manual mode input to script (will be empty for scheduled runs)
+          MANUAL_MODE: ${{ github.event.inputs.mode }}
         run: |
           mkdir -p .cache
           python main_improved_action.py
