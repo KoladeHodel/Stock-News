@@ -1,28 +1,10 @@
 #!/usr/bin/env python3
 """
-main_improved_action.py (updated)
+main_improved_action.py (cache-enabled)
 
-Improved GitHub Actions one-shot poller (full file):
- - Auto S&P500 + NASDAQ-100 (Wikipedia)
- - Rotation by GITHUB_RUN_NUMBER / time to process the universe in chunks
- - Focused Google News RSS queries per ticker/company + event keywords
- - Classifies only your 6 event types and alerts via Telegram (required) + optional Slack/Email
- - No persistence (dedupe only in-run)
- - Filters out items older than RECENT_DAYS (default 7)
- - Daily digest at configured local hour (Europe/Paris by default)
-
-Environment variables:
- - TELEGRAM_BOT_TOKEN (required)
- - TELEGRAM_CHAT_ID  (required)
- - SLACK_WEBHOOK (optional)
- - SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_EMAIL_TO (optional)
- - MAX_TICKERS (default 250) -- how many tickers processed this run
- - TIMEZONE (default Europe/Paris)
- - DAILY_DIGEST_HOUR (default 8)
- - THROTTLE_SECONDS (default 0.4)
- - RECENT_DAYS (default 7) -- ignore news older than this many days
- - USER_AGENT (optional HTTP user agent override)
- - GITHUB_RUN_NUMBER (provided by Actions; used for rotation)
+Same improved script as before (S&P500 + NASDAQ100, rotation, RECENT_DAYS),
+but now it persists the in-run 'seen' fingerprints to .cache/seen.json using
+a simple file. GitHub Actions will persist that directory via actions/cache.
 """
 
 import os
@@ -37,6 +19,7 @@ import pytz
 from email.message import EmailMessage
 import smtplib
 import re
+import json
 
 # ---------------- Config ----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -55,6 +38,10 @@ THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "0.4"))
 USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (compatible; MarketAlerts/1.0)")
 RECENT_DAYS = int(os.getenv("RECENT_DAYS", "7"))  # only accept items within this many days
 
+# file used for cross-run dedupe (persisted via GitHub Actions cache)
+CACHE_DIR = ".cache"
+SEEN_FILE = os.path.join(CACHE_DIR, "seen.json")
+
 # keywords used to build Google News query - grouped to match your 6 types
 KEYWORDS = [
     "earnings", "quarterly results", "eps", "revenue", "beats", "misses",
@@ -70,6 +57,7 @@ TARGET_LABELS = {"earnings", "takeover", "scandal", "product_launch", "venture_r
 
 # ---------------- Utilities ----------------
 def fingerprint(title, link, published):
+    # include published string in fp so small updates create new fp
     return hashlib.sha256(f"{title}|{link}|{published}".encode()).hexdigest()
 
 def safe_get(url, timeout=15):
@@ -90,6 +78,36 @@ def post_json(url, json_payload, timeout=10):
     except Exception as e:
         print(f"POST error to {url}: {e}")
         return False
+
+# ---------------- Persisted seen helpers ----------------
+def load_seen():
+    """Load seen fingerprints from SEEN_FILE (returns a set)."""
+    try:
+        if not os.path.exists(CACHE_DIR):
+            os.makedirs(CACHE_DIR, exist_ok=True)
+        if os.path.exists(SEEN_FILE):
+            with open(SEEN_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return set(data)
+                elif isinstance(data, dict):
+                    return set(data.keys())
+        return set()
+    except Exception as e:
+        print("Error loading seen file:", e)
+        return set()
+
+def save_seen(seen_set):
+    """Write the seen_set (iterable) to SEEN_FILE as a list (atomic write)."""
+    try:
+        if not os.path.exists(CACHE_DIR):
+            os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = SEEN_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(seen_set), f)
+        os.replace(tmp, SEEN_FILE)
+    except Exception as e:
+        print("Error saving seen file:", e)
 
 # ---------------- Notify channels ----------------
 def notify_telegram(text):
@@ -194,12 +212,6 @@ def build_google_news_rss(ticker, name):
 
 # ---------------- Date parsing & recency filter ----------------
 def parse_entry_published(entry, target_tz):
-    """
-    Return a timezone-aware datetime for the feed entry published time.
-    Uses published_parsed if available, otherwise tries ISO-like parsing.
-    If parsing fails, return None.
-    """
-    # entry may be a feedparser entry (mapping-like)
     try:
         if entry.get("published_parsed"):
             ts = time.mktime(entry["published_parsed"])
@@ -212,7 +224,6 @@ def parse_entry_published(entry, target_tz):
     if pub:
         s = pub.strip()
         try:
-            # normalize trailing Z
             if s.endswith("Z"):
                 s = s[:-1] + "+00:00"
             dt = datetime.fromisoformat(s)
@@ -220,16 +231,6 @@ def parse_entry_published(entry, target_tz):
                 dt = dt.replace(tzinfo=pytz.UTC)
             return dt.astimezone(target_tz)
         except Exception:
-            # try parsing common formats loosely
-            try:
-                # feedparser sometimes gives RFC822-like strings; attempt to parse via feedparser
-                parsed = feedparser.parse("http://example.com/?" + urllib.parse.quote_plus(s))
-                if parsed and parsed.entries:
-                    # hacky fallback - not reliable
-                    pass
-            except Exception:
-                pass
-            # last resort: extract a 4-digit year and return Jan 1 of that year (conservative -> will likely be too old)
             m = re.search(r"(20\d{2})", s)
             if m:
                 try:
@@ -242,7 +243,7 @@ def parse_entry_published(entry, target_tz):
 def is_recent_entry(entry, target_tz, days=RECENT_DAYS):
     dt = parse_entry_published(entry, target_tz)
     if not dt:
-        # if we can't parse, be conservative and skip it
+        # skip undated entries to avoid repeating old evergreen content
         return False
     now = datetime.now(target_tz)
     return (now - dt) <= timedelta(days=days)
@@ -276,7 +277,6 @@ def poll_feed(url):
     items = []
     try:
         parsed = feedparser.parse(url)
-        # return raw entries so we preserve published_parsed etc.
         for e in parsed.entries:
             items.append(e)
     except Exception as e:
@@ -292,6 +292,10 @@ def main():
     tz = pytz.timezone(TIMEZONE)
     now_local = datetime.now(tz)
     date_iso = now_local.strftime("%Y-%m-%d")
+
+    # load persisted seen fingerprints (from cache)
+    seen = load_seen()
+    print(f"Loaded {len(seen)} seen fingerprints from cache.")
 
     # fetch lists
     sp = get_sp500_list()
@@ -336,7 +340,6 @@ def main():
     for ticker, cname in selected:
         feeds.append((ticker, cname, build_google_news_rss(ticker, cname)))
 
-    seen = set()
     digest = []
 
     # poll each feed
@@ -355,8 +358,11 @@ def main():
             published_str = entry.get("published") or entry.get("updated") or ""
             fp = fingerprint(title, link, published_str)
             if fp in seen:
+                # skip items we've already alerted on in prior runs
                 continue
+            # add to seen now to avoid duplicates within same run and across future runs
             seen.add(fp)
+
             label = classify(title, summary)
             if label == "other":
                 continue
@@ -378,11 +384,11 @@ def main():
     try:
         yahoo_items = fetch_yahoo_earnings_for_date(date_iso)
         for it in yahoo_items:
-            # create a minimal fake entry to use recency parser logic
             fake_entry = {"title": it["title"], "link": it["link"], "published": it["published"]}
             if not is_recent_entry(fake_entry, tz, RECENT_DAYS):
                 continue
-            fp = fingerprint(it["title"], it["link"], it["published"])
+            published_str = it["published"]
+            fp = fingerprint(it["title"], it["link"], published_str)
             if fp in seen:
                 continue
             seen.add(fp)
@@ -409,6 +415,13 @@ def main():
             print("Digest hour but no items to include.")
     else:
         print(f"Run complete at {now_local.isoformat()}; not digest hour ({DAILY_DIGEST_HOUR}).")
+
+    # save updated seen set to cache file so future runs skip these items
+    try:
+        save_seen(seen)
+        print(f"Saved {len(seen)} fingerprints to {SEEN_FILE}")
+    except Exception as e:
+        print("Error saving seen cache at end:", e)
 
 # ---------------- Yahoo earnings scraper ----------------
 def fetch_yahoo_earnings_for_date(date_iso):
