@@ -587,15 +587,14 @@ def main():
     print(f"MANUAL_MODE raw: {manual_mode_env_raw}")
     print(f"MANUAL_MODE parsed: {manual_mode_env}")
 
-    if manual_run:
-        if manual_mode_env == "evening":
-            is_morning = False
-            is_evening = True
-            print("Manual run requested: EVENING (delta) mode.")
-        else:
-            is_morning = True
-            is_evening = False
-            print("Manual run requested: MORNING (full) mode.")
+    if manual_mode_env == "morning":
+        is_morning = True
+        is_evening = False
+        print("Override requested: MORNING (full) mode.")
+    elif manual_mode_env == "evening":
+        is_morning = False
+        is_evening = True
+        print("Override requested: EVENING (delta) mode.")
     else:
         is_morning = (local_hour == DAILY_DIGEST_HOUR_MORNING)
         is_evening = (local_hour == DAILY_DIGEST_HOUR_EVENING)
