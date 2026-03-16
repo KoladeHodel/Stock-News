@@ -2,8 +2,9 @@ name: Poll US Market (S&P500 + NASDAQ100) & Digest (morning + evening delta)
 
 on:
   schedule:
-    - cron: '0 4 * * *'
-    - cron: '0 18 * * *'
+    # Change these anytime; update the MANUAL_MODE mapping below to match.
+    - cron: '0 4 * * *'   # scheduled run intended as MORNING
+    - cron: '0 18 * * *'  # scheduled run intended as EVENING
   workflow_dispatch:
     inputs:
       mode:
@@ -22,6 +23,7 @@ on:
 jobs:
   run-poll:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -53,15 +55,27 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+
           TIMEZONE: Europe/Paris
           DAILY_DIGEST_HOUR_MORNING: '5'
-          DAILY_DIGEST_HOUR_EVENING: '18'
+          DAILY_DIGEST_HOUR_EVENING: '19'
+
           MAX_TICKERS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.max_tickers || '200' }}
           PROCESS_ALL_BATCHES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.process_all || 'true' }}
+
           THROTTLE_SECONDS: '0.4'
           RECENT_DAYS: '2'
           UPCOMING_DAYS: '5'
-          MANUAL_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode || '' }}
+
+          # Manual runs use the UI input.
+          # Scheduled runs are explicitly mapped from the cron that fired,
+          # so you can change cron times later without touching the script logic.
+          MANUAL_MODE: >-
+            ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode ||
+                github.event.schedule == '0 4 * * *' && 'morning' ||
+                github.event.schedule == '0 18 * * *' && 'evening' ||
+                '' }}
+
         run: |
           mkdir -p .cache
           python main_improved_action.py
