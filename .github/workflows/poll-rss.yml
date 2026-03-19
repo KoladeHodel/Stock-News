@@ -64,8 +64,8 @@ jobs:
           PROCESS_ALL_BATCHES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.process_all || 'true' }}
 
           THROTTLE_SECONDS: '0.4'
-          RECENT_DAYS: '2'
-          UPCOMING_DAYS: '5'
+          RECENT_DAYS: '1'
+          UPCOMING_DAYS: '2'
 
           # Manual runs use the UI input.
           # Scheduled runs are explicitly mapped from the cron that fired,
