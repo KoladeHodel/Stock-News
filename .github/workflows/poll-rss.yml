@@ -3,8 +3,8 @@ name: Poll US Market (S&P500 + NASDAQ100) & Digest (morning + evening delta)
 on:
   schedule:
     # Change these anytime; update the MANUAL_MODE mapping below to match.
-    - cron: '0 4 * * *'   # scheduled run intended as MORNING
-    - cron: '0 18 * * *'  # scheduled run intended as EVENING
+   # - cron: '0 4 * * *'   # scheduled run intended as MORNING
+ #   - cron: '0 18 * * *'  # scheduled run intended as EVENING
   workflow_dispatch:
     inputs:
       mode:
